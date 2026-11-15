@@ -1,0 +1,26 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+
+# Internal documentation and sensitive project files
+AGENTS.md
+plan.md
+denetim.md
+
+# Keystores and signing
+*.jks
+*.keystore
+*.p12
+key.properties
+
+# Environment variables
+.env
+.env.*
