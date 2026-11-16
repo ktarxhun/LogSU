@@ -51,6 +51,9 @@ class AudioCaptureController {
     @Volatile
     private var isRecording = false
 
+    /** Servis onDestroy gibi kapanis yollarinda kaydin hala acik olup olmadigini bildirir. */
+    fun isActiveRecording(): Boolean = isRecording
+
     /**
      * Ses kaydı başlatır.
      * enableDualInternalMic = true: Stereo WAV (Sol=Mikrofon, Sağ=Karşı Taraf / Dahili Ses)
