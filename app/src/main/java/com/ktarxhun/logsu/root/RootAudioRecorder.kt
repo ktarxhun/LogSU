@@ -1,5 +1,6 @@
 package com.ktarxhun.logsu.root
 
+import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -186,6 +187,7 @@ object RootAudioRecorder {
         return watchdog
     }
 
+    @SuppressLint("MissingPermission")
     private fun createRecord(bufferSize: Int): AudioRecord? {
         val sources = intArrayOf(
             MediaRecorder.AudioSource.VOICE_CALL,
