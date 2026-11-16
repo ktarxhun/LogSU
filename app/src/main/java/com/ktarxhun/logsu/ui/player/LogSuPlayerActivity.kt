@@ -680,21 +680,25 @@ fun GuestSessionPlayerScreen(
                 }
 
                 if (session != null) {
+                    val sessionActive = session!!.isActive
                     if (session!!.videoFilePath != null) {
                         IconButton(
-                            enabled = !isExporting,
+                            enabled = !isExporting && !sessionActive,
                             onClick = {
                                 session?.videoFilePath?.let { vPath ->
                                     isExporting = true
                                     scope.launch {
-                                        val aFile = session?.audioFilePath?.let { File(it) }
-                                        GalleryExporter.exportVideoToGallery(
-                                            context = context,
-                                            videoFile = File(vPath),
-                                            audioFile = aFile,
-                                            customName = "LogSU_Emanet_Oturum_${session?.id}"
-                                        )
-                                        isExporting = false
+                                        try {
+                                            val aFile = session?.audioFilePath?.let { File(it) }
+                                            GalleryExporter.exportVideoToGallery(
+                                                context = context,
+                                                videoFile = File(vPath),
+                                                audioFile = aFile,
+                                                customName = "LogSU_Emanet_Oturum_${session?.id}"
+                                            )
+                                        } finally {
+                                            isExporting = false
+                                        }
                                     }
                                 }
                             }
@@ -702,13 +706,26 @@ fun GuestSessionPlayerScreen(
                             if (isExporting) {
                                 CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AccentPrimary)
                             } else {
-                                Icon(Icons.Default.Movie, contentDescription = "Galeriye Kaydet", tint = AccentPrimary)
+                                Icon(
+                                    Icons.Default.Movie,
+                                    contentDescription = "Galeriye Kaydet",
+                                    tint = if (sessionActive) TextSecondary.copy(alpha = 0.4f) else AccentPrimary
+                                )
                             }
                         }
                     }
 
-                    IconButton(onClick = { showDeleteConfirm = true }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Sil", tint = AccentRed.copy(alpha = 0.85f))
+                    // Aktif oturum hala yaziliyor: silme engellenir, aksi halde servis
+                    // silinmis satira yazip coker ve dosyalar sahipsiz kalir.
+                    IconButton(
+                        enabled = !sessionActive,
+                        onClick = { showDeleteConfirm = true }
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Sil",
+                            tint = if (sessionActive) TextSecondary.copy(alpha = 0.4f) else AccentRed.copy(alpha = 0.85f)
+                        )
                     }
                 }
             }
@@ -773,6 +790,7 @@ fun GuestSessionPlayerScreen(
                             micEnabled = micEnabled,
                             internalEnabled = internalEnabled,
                             isExporting = isExporting,
+                            canExport = session?.isActive == false,
                             totalSwitches = session?.totalAppSwitches ?: 0,
                             totalCopies = session?.totalClipboardCopies ?: 0,
                             onToggleMic = {
@@ -784,7 +802,7 @@ fun GuestSessionPlayerScreen(
                                 channelProcessor.rightEnabled = internalEnabled
                             },
                             onExport = {
-                                session?.videoFilePath?.let { vPath ->
+                                session?.takeIf { !it.isActive }?.videoFilePath?.let { vPath ->
                                     isExporting = true
                                     scope.launch {
                                         try {
@@ -836,7 +854,7 @@ fun GuestSessionPlayerScreen(
         }
     }
 
-    if (showDeleteConfirm && session != null) {
+    if (showDeleteConfirm && session != null && !session!!.isActive) {
         ConfirmDeleteDialog(
             title = "Emanet Oturumunu Sil",
             message = "\"Oturum #${session!!.id}\" ve tüm ekran/ses/fotoğraf kayıtları silinecek. Onaylıyor musunuz?",
@@ -845,6 +863,17 @@ fun GuestSessionPlayerScreen(
                 showDeleteConfirm = false
                 scope.launch {
                     try {
+                        val fresh = withContext(Dispatchers.IO) {
+                            LogSuApp.instance.repository.getGuestSessionById(target.id)
+                        }
+                        if (fresh == null) {
+                            onBack()
+                            return@launch
+                        }
+                        if (fresh.isActive) {
+                            Toast.makeText(context, "Kayıt sürüyor, oturum silinemez.", Toast.LENGTH_SHORT).show()
+                            return@launch
+                        }
                         exoPlayer.stop()
                         LogSuApp.instance.repository.deleteGuestSession(target)
                         onBack()
@@ -897,6 +926,7 @@ private fun GuestSideControlsCard(
     micEnabled: Boolean,
     internalEnabled: Boolean,
     isExporting: Boolean,
+    canExport: Boolean,
     totalSwitches: Int,
     totalCopies: Int,
     onToggleMic: () -> Unit,
@@ -985,7 +1015,7 @@ private fun GuestSideControlsCard(
 
             Button(
                 onClick = onExport,
-                enabled = !isExporting,
+                enabled = !isExporting && canExport,
                 colors = ButtonDefaults.buttonColors(containerColor = AccentGreen),
                 shape = RoundedCornerShape(8.dp),
                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
@@ -998,7 +1028,7 @@ private fun GuestSideControlsCard(
                 } else {
                     Icon(Icons.Default.Movie, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Galeriye Kaydet", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text(if (canExport) "Galeriye Kaydet" else "Kayıt Sürüyor", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
