@@ -187,7 +187,18 @@ class CallMonitorService : Service() {
                             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                     )
                 } catch (e: SecurityException) {
-                    Log.w(TAG, "Microphone FGS type reddedildi, specialUse ile devam ediliyor: ${e.message}")
+                    val rootReady = RootShellManager.isRootCached() || RootShellManager.isRootAvailable()
+                    val audioPathInfo = if (rootReady) {
+                        "Cagri sesi root yardimci kaydedici ile alinacak."
+                    } else {
+                        "Root yok, uygulama UID'sindeki mikrofon sistem tarafindan sessize alinabilir."
+                    }
+                    Log.e(
+                        TAG,
+                        "MICROPHONE FGS tipi reddedildi, specialUse ile devam ediliyor. " +
+                            "root=$rootReady. $audioPathInfo Hata: ${e.message}",
+                        e
+                    )
                     startForeground(
                         1001,
                         notification,
@@ -226,7 +237,12 @@ class CallMonitorService : Service() {
         serviceScope.launch {
             sessionMutex.withLock {
                 if (!isRecording) return@withLock
-                val started = audioController.startRecording(targetFile, enableDualInternalMic = isDualChannel)
+                val started = audioController.startRecording(
+                    targetFile,
+                    enableDualInternalMic = isDualChannel,
+                    useRootCapture = isDualChannel,
+                    rootApkPath = packageCodePath
+                )
                 if (!started) {
                     Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
                     isRecording = false
