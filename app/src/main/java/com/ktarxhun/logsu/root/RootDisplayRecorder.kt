@@ -24,11 +24,15 @@ import kotlin.system.exitProcess
  */
 object RootDisplayRecorder {
 
+    // stopFile hic olusmazsa (uygulama sureci olurse) kayit sonsuza kadar acik kalmasin.
+    private const val DEFAULT_MAX_DURATION_MS = 60L * 60L * 1000L
+    private const val MAX_OUTPUT_BYTES = 3_500_000_000L
+
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @JvmStatic
     fun main(args: Array<String>) {
         if (args.size < 5) {
-            System.err.println("Kullanim: RootDisplayRecorder <outputMp4> <width> <height> <bitRate> <stopFile>")
+            System.err.println("Kullanim: RootDisplayRecorder <outputMp4> <width> <height> <bitRate> <stopFile> [parentPid] [maxDurationMs]")
             exitProcess(2)
         }
 
@@ -42,6 +46,11 @@ object RootDisplayRecorder {
         val height = args[2].toIntOrNull()?.coerceAtLeast(320) ?: 2400
         val bitRate = args[3].toIntOrNull()?.coerceAtLeast(500_000) ?: 10_000_000
         val stopFile = File(args[4])
+        val parentPid = args.getOrNull(5)?.toIntOrNull() ?: -1
+        val maxDurationMs = args.getOrNull(6)?.toLongOrNull()
+            ?.takeIf { it in 1_000L..86_400_000L }
+            ?: DEFAULT_MAX_DURATION_MS
+        val startTimeMs = System.currentTimeMillis()
 
         try {
             Looper.prepareMainLooper()
@@ -126,15 +135,37 @@ object RootDisplayRecorder {
             var eosDeadlineMs = 0L
             var firstPtsUs = -1L
             var lastWrittenPtsUs = -1L
+            var nextWatchdogCheckMs = startTimeMs + 2_000L
+            var nextSizeCheckMs = startTimeMs + 5_000L
+
+            fun requestEos(reason: String) {
+                System.err.println(reason)
+                eosSignaled = true
+                eosDeadlineMs = System.currentTimeMillis() + 2000L
+                try {
+                    encoder.signalEndOfInputStream()
+                } catch (e: Exception) {
+                    System.err.println("signalEndOfInputStream hatasi: ${e.message}")
+                }
+            }
 
             while (true) {
-                if (!eosSignaled && stopFile.exists()) {
-                    eosSignaled = true
-                    eosDeadlineMs = System.currentTimeMillis() + 2000L
-                    try {
-                        encoder.signalEndOfInputStream()
-                    } catch (_: Exception) {
-                        break
+                if (!eosSignaled) {
+                    val now = System.currentTimeMillis()
+                    if (stopFile.exists()) {
+                        requestEos("Durma bayragi goruldu, kayit kapatiliyor.")
+                    } else if (now - startTimeMs >= maxDurationMs) {
+                        requestEos("Azami kayit suresi asildi, kayit kapatiliyor.")
+                    } else if (parentPid > 0 && now >= nextWatchdogCheckMs) {
+                        nextWatchdogCheckMs = now + 2_000L
+                        if (!File("/proc/$parentPid").exists()) {
+                            requestEos("Ebeveyn surec ($parentPid) artik yok, kayit kapatiliyor.")
+                        }
+                    } else if (now >= nextSizeCheckMs) {
+                        nextSizeCheckMs = now + 5_000L
+                        if (File(outputPath).length() > MAX_OUTPUT_BYTES) {
+                            requestEos("Azami dosya boyutu asildi, kayit kapatiliyor.")
+                        }
                     }
                 }
 

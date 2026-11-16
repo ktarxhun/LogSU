@@ -78,9 +78,7 @@ class RecordRepository(
             val current = callRecordDao.getRecordById(record.id) ?: continue
             if (current.isLocked) continue
             try {
-                deleteFiles(listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath))
-                val removed = callRecordDao.deleteUnlockedRecordById(current.id)
-                if (removed > 0) {
+                if (purgeRecord(current)) {
                     purgedCount++
                 }
             } catch (e: IOException) {
@@ -88,6 +86,79 @@ class RecordRepository(
             }
         }
         return purgedCount
+    }
+
+    /**
+     * Temizlikte kilit yarisini onler: dosyalar once gecici ada tasinir, DB satiri yalnizca
+     * kilit hala kapaliysa silinir. Kullanici bu arada "Korumaya Al" derse satir silinmez
+     * ve dosyalar geri tasinarak kilitli kayit dosyasiz birakilmaz.
+     */
+    private suspend fun purgeRecord(current: CallRecord): Boolean = withContext(Dispatchers.IO) {
+        val files = listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath)
+            .filterNotNull()
+            .distinct()
+            .map { File(it) }
+            .filter { it.exists() }
+
+        if (files.any { !it.isFile }) {
+            throw IOException("Kayıt dosyası silinemedi")
+        }
+
+        val quarantined = mutableListOf<Pair<File, File>>()
+        try {
+            for (file in files) {
+                val temp = File(file.parentFile, "${file.name}.purge_${System.nanoTime()}")
+                if (!moveFile(file, temp)) {
+                    throw IOException("Kayıt dosyası silinemedi")
+                }
+                quarantined.add(file to temp)
+            }
+            val removed = callRecordDao.deleteUnlockedRecordById(current.id)
+            if (removed > 0) {
+                for ((_, temp) in quarantined) {
+                    deleteFileQuietly(temp)
+                }
+                true
+            } else {
+                // Kayit bu arada kilitlendi: dosyalar geri tasinir, kayit delil olarak korunur.
+                for ((original, temp) in quarantined) {
+                    if (!moveFile(temp, original)) {
+                        runCatching { Log.w(TAG, "Kilitlenen kaydin dosyasi geri tasinamadi: ${original.name}") }
+                    }
+                }
+                false
+            }
+        } catch (e: Exception) {
+            for ((original, temp) in quarantined) {
+                moveFile(temp, original)
+            }
+            throw if (e is IOException) e else IOException("Kayıt temizlenemedi: ${e.message}", e)
+        }
+    }
+
+    private fun moveFile(from: File, to: File): Boolean {
+        if (!from.exists()) return true
+        if (from.renameTo(to)) return true
+        val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
+        if (hasRoot) {
+            runCatching {
+                RootShellManager.execute(
+                    "mv -f ${RootShellManager.shellQuote(from.absolutePath)} ${RootShellManager.shellQuote(to.absolutePath)} 2>/dev/null"
+                )
+            }
+        }
+        return !from.exists() && to.exists()
+    }
+
+    private fun deleteFileQuietly(file: File) {
+        if (!file.exists()) return
+        if (file.delete()) return
+        val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
+        if (hasRoot) {
+            runCatching {
+                RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)} 2>/dev/null")
+            }
+        }
     }
 
     // Emanet Oturumu Fonksiyonları

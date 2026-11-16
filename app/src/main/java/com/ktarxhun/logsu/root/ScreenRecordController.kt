@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Build
 import android.os.PowerManager
+import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -18,6 +19,8 @@ import java.util.Collections
 class ScreenRecordController {
     companion object {
         private const val TAG = "ScreenRecordController"
+        private const val MAX_RECORD_DURATION_MS = 60L * 60L * 1000L
+        private val SEGMENT_NAME_REGEX = Regex(""".*_seg\d+\.mp4""")
     }
 
     private val stateMutex = Mutex()
@@ -58,6 +61,8 @@ class ScreenRecordController {
 
             // Yalnızca takılı kalmış eski screenrecord süreci varsa temizle
             RootShellManager.execute("if pidof screenrecord >/dev/null 2>&1; then killall -2 screenrecord 2>/dev/null; sleep 0.2; fi")
+            // Onceki cokmelerden kalan root kaydedicileri ve artik segmentleri de temizle
+            cleanupOrphanedRecorders(outputFile)
 
             val powerManager = context.getSystemService(PowerManager::class.java)
             val apkPath = context.packageCodePath
@@ -66,6 +71,7 @@ class ScreenRecordController {
             val height = sizeParts.getOrNull(1)?.toIntOrNull() ?: 2400
 
             val nativeTimeLimitArg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) "0" else "180"
+            val appPid = Process.myPid()
 
             supervisorJob = CoroutineScope(Dispatchers.IO).launch {
                 var partIdx = 0
@@ -83,13 +89,14 @@ class ScreenRecordController {
                         "${outputFile.nameWithoutExtension}_seg${partIdx++}.mp4"
                     )
                     val errFile = File(context.cacheDir, "screenrecord_err.log")
-                    val stopFile = File(context.cacheDir, "rec_stop_${System.nanoTime()}.flag")
+                    // Durma bayragi cache yerine filesDir altinda tutulur; cache temizligi kaydediciyi kilitlemesin.
+                    val stopFile = File(context.filesDir, "rec_stop_${System.nanoTime()}.flag")
                     segmentFiles.add(segFile)
 
                     val usingDisplayRecorder = useVirtualDisplay
                     val cmd = if (usingDisplayRecorder) {
                         activeStopFile = stopFile
-                        "rm -f ${RootShellManager.shellQuote(stopFile.absolutePath)}; CLASSPATH=${RootShellManager.shellQuote(apkPath!!)} app_process /system/bin com.ktarxhun.logsu.root.RootDisplayRecorder ${RootShellManager.shellQuote(segFile.absolutePath)} $width $height $bitRate ${RootShellManager.shellQuote(stopFile.absolutePath)} >/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
+                        "rm -f ${RootShellManager.shellQuote(stopFile.absolutePath)}; CLASSPATH=${RootShellManager.shellQuote(apkPath!!)} app_process /system/bin com.ktarxhun.logsu.root.RootDisplayRecorder ${RootShellManager.shellQuote(segFile.absolutePath)} $width $height $bitRate ${RootShellManager.shellQuote(stopFile.absolutePath)} $appPid $MAX_RECORD_DURATION_MS >/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
                     } else {
                         activeStopFile = null
                         "screenrecord --bit-rate $bitRate --size $size --time-limit $nativeTimeLimitArg ${RootShellManager.shellQuote(segFile.absolutePath)} >/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
@@ -164,6 +171,33 @@ class ScreenRecordController {
                 }
             }
             true
+        }
+    }
+
+    /**
+     * Onceki cokme veya zorla kapatma sonrasi ayakta kalan root kaydedicileri oldurur
+     * ve artik segment dosyalarini temizler. Boylece ayni anda iki kaydedici calismaz.
+     */
+    private suspend fun cleanupOrphanedRecorders(outputFile: File) {
+        // Karakter sinifi kullanimi, pkill'in kendi komut satirini eslemesini engeller
+        runCatching {
+            RootShellManager.execute(
+                "pkill -f 'com.ktarxhun.logsu.root.RootDisplayRecor[d]er' 2>/dev/null; true"
+            )
+        }.onFailure { Log.w(TAG, "Artik root kaydedici temizligi basarisiz", it) }
+
+        val parent = outputFile.parentFile ?: return
+        val cutoff = System.currentTimeMillis() - 10L * 60L * 1000L
+        val stale = runCatching {
+            parent.listFiles { file ->
+                file.isFile && SEGMENT_NAME_REGEX.matches(file.name) && file.lastModified() < cutoff
+            }
+        }.getOrNull() ?: return
+
+        for (file in stale) {
+            runCatching {
+                RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)} 2>/dev/null")
+            }.onFailure { Log.w(TAG, "Artik segment silinemedi: ${file.name}", it) }
         }
     }
 
