@@ -38,11 +38,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -223,6 +221,23 @@ class GuestGuardService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Baslatma hata yollarinda oturum durumunu geri alir. Aksi halde on plan servis,
+     * bildirim ve tile acik kalir, Dashboard perdeyi kapatamaz.
+     */
+    private fun abortSessionStart(reason: String) {
+        Log.e(TAG, "Emanet oturumu baslatilamadi: $reason")
+        _isSessionActiveFlow.value = false
+        getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
+        SystemProtectionTileService.requestRefresh(this)
+        cancelPhotoTasks()
+        releaseActiveCamera()
+        unregisterScreenReceiver()
+        removeClipboardListener()
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelf()
+    }
+
     private fun startGuestSession() {
         if (!_isSessionActiveFlow.value) {
             Log.w(TAG, "Emanet oturumu baslatma istegi pasif durumda geldi, yoksayildi")
@@ -264,10 +279,7 @@ class GuestGuardService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "startForeground basarisiz oldu", e)
-            _isSessionActiveFlow.value = false
-            getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
-            SystemProtectionTileService.requestRefresh(this)
-            stopSelf()
+            abortSessionStart("On plan servis baslatilamadi")
             return
         }
 
@@ -292,7 +304,7 @@ class GuestGuardService : Service() {
                 }
                 val repository = LogSuApp.instance?.repository
                 if (repository == null) {
-                    Log.e(TAG, "Depo erisilemiyor, emanet oturumu baslatilamadi")
+                    abortSessionStart("Depo erisilemiyor")
                     return@withLock
                 }
 
@@ -300,6 +312,7 @@ class GuestGuardService : Service() {
                     repository.startGuestSession()
                 } catch (e: Exception) {
                     Log.e(TAG, "Emanet oturumu kaydedilemedi", e)
+                    abortSessionStart("Oturum kaydi olusturulamadi")
                     return@withLock
                 }
                 activeSessionId = sessionId
@@ -809,24 +822,14 @@ class GuestGuardService : Service() {
         startSessionJob?.cancel()
         startSessionJob = null
 
-        // Servis yok edilirken kayit kontrolculeri kosulsuz kapatilir. Aksi halde stopGuestSession
-        // cagrilmadan servis olurse mikrofon, ekran kaydi ve dokunma okuyucu acik kalir.
-        runCatching {
-            runBlocking {
-                withTimeoutOrNull(10_000L) {
-                    withContext(NonCancellable + Dispatchers.IO) {
-                        runCatching { touchController.stopCapture() }
-                        sessionMutex.withLock { closeSessionResourcesAndRecord() }
-                    }
-                }
-            }
-        }
+        // Servis yok edilirken kayit kontrolculeri kosulsuz kapatilir. Ana thread'de runBlocking
+        // kullanilmaz; kapatma mevcut stopGuestSession akisina (NonCancellable + IO) birakilir.
+        stopGuestSession()
 
         cameraThread?.quitSafely()
         cameraThread = null
         cameraHandler = null
         stopSessionJob = null
-        serviceScope.cancel()
         instance = null
         super.onDestroy()
     }

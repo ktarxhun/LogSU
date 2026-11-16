@@ -17,6 +17,7 @@ import com.ktarxhun.logsu.data.db.LogSuDatabase
 import com.ktarxhun.logsu.data.model.CallType
 import com.ktarxhun.logsu.data.repository.RecordRepository
 import com.ktarxhun.logsu.service.CallMonitorService
+import com.ktarxhun.logsu.service.CallReceiver
 import com.ktarxhun.logsu.service.GuestGuardService
 import com.ktarxhun.logsu.service.RetentionWorker
 import com.ktarxhun.logsu.ui.auth.AppSessionLock
@@ -66,6 +67,9 @@ class LogSuApp : Application() {
         createNotificationChannels()
         scheduleRetentionWorker()
         GuestGuardService.initPrefs(this)
+        appScope.launch {
+            runCatching { CallReceiver.resetStateIfStale(this@LogSuApp) }
+        }
         if (!GuestGuardService.isSessionActive) {
             appScope.launch {
                 runCatching { repository.closeOrphanedGuestSessions() }
@@ -128,7 +132,7 @@ class LogSuApp : Application() {
                 }
                 if (isGsmCallBusy(audioManager)) {
                     // GSM aramasinin kaydini VoIP izleyicisi durdurmamali; kapatmayi CallReceiver yonetir.
-                    isVoipCallActive = false
+                    // Bayrak korunur, boylece VoIP gorusmesi kapandiginda kayit kapanabilir.
                     Log.i(TAG, "GSM aramasi suruyor, VoIP izleyicisi kaydi durdurmuyor")
                     return@launch
                 }

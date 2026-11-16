@@ -418,8 +418,9 @@ class AudioCaptureController {
 
         for (i in 0 until ROOT_STARTUP_ATTEMPTS) {
             Thread.sleep(ROOT_STARTUP_WAIT_MS)
-            // 44 baytlik WAV basligi yalnizca AudioRecord basariyla acildiktan sonra yazilir.
-            if (targetWavFile.exists() && targetWavFile.length() >= 44L) {
+            // 44 baytlik WAV basligi yalnizca AudioRecord basariyla acildiktan sonra yazilir;
+            // gercek veri beklenerek >44 sartinin gecmesi saglanir.
+            if (targetWavFile.exists() && targetWavFile.length() > 44L) {
                 started = true
                 break
             }
@@ -444,15 +445,10 @@ class AudioCaptureController {
         }
 
         if (!started) {
-            val processAlive = File("/proc/$pid").exists()
             if (lastError.isEmpty()) lastError = readRootError(errFile)
-            if (processAlive && lastError.isEmpty()) {
-                // Gec baslatma: gecen sure kaydi baslatmamak icin yeterli degil, dosya silinmez.
-                started = true
-                Log.w(TAG, "Root ses kaydedici gec basladi (PID=$pid, ${SystemClock.elapsedRealtime() - startupBeganAt} ms), kayit surduruluyor")
-            } else {
-                Log.e(TAG, "Root ses kaydedici baslayamadi (PID=$pid, ${failureReason ?: "zaman asimi"}): $lastError")
-            }
+            // "Surec hayatta" kabulü yok: dosya gercek veri uretmiyorsa kok yolundan cikilir
+            // ve normal (uygulama UID) AudioRecord yedege donulur.
+            Log.e(TAG, "Root ses kaydedici baslayamadi (PID=$pid, ${failureReason ?: "zaman asimi"}): $lastError")
         }
 
         if (!started) {

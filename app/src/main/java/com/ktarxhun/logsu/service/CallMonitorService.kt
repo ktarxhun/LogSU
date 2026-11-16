@@ -241,28 +241,38 @@ class CallMonitorService : Service() {
         Log.i(TAG, "Ses kaydi oturumu baslatildi: $phoneNumber ($callType, dual=$isDualChannel)")
 
         serviceScope.launch {
-            var startFailed = false
-            sessionMutex.withLock {
-                if (!isRecording) return@withLock
-                val started = audioController.startRecording(
-                    targetFile,
-                    enableDualInternalMic = isDualChannel,
-                    useRootCapture = isDualChannel,
-                    rootApkPath = packageCodePath
-                )
-                if (!started) {
-                    Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
-                    startFailed = true
-                    isRecording = false
-                    if (callType == CallType.AMBIENT_RECORDING) {
-                        _isAmbientRecordingFlow.value = false
+            if (!isRecording) return@launch
+            // Root baslangici (ART yukleme + AudioRecord) 9 sn kadar sessionMutex'i tutmaz;
+            // boylece siradaki durdurma istegi bu beklemeden gecikirmez.
+            val started = audioController.startRecording(
+                targetFile,
+                enableDualInternalMic = isDualChannel,
+                useRootCapture = isDualChannel,
+                rootApkPath = packageCodePath
+            )
+            if (!started) {
+                sessionMutex.withLock {
+                    if (isRecording) {
+                        Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
+                        isRecording = false
+                        if (callType == CallType.AMBIENT_RECORDING) {
+                            _isAmbientRecordingFlow.value = false
+                        }
+                        targetFile.delete()
+                        audioFile = null
                     }
+                }
+                shutdownIfIdle("kayit baslatilamadi")
+                return@launch
+            }
+            if (!isRecording) {
+                // Baslatma sirasinda durdurma geldi; acilan kaynagi hemen kapat ve dosyayi temizle.
+                sessionMutex.withLock {
+                    runCatching { audioController.stopRecordingSuspend() }
                     targetFile.delete()
                     audioFile = null
                 }
-            }
-            if (startFailed) {
-                shutdownIfIdle("kayit baslatilamadi")
+                shutdownIfIdle("kayit baslatilamadan durduruldu")
             }
         }
     }

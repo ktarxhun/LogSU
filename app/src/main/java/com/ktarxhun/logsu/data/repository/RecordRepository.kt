@@ -45,7 +45,7 @@ class RecordRepository(
                     throw IOException("Kayıt dosyası silinemedi")
                 }
                 if (!file.delete()) {
-                    val hasRoot = runCatching { RootShellManager.isRootCached() }.getOrDefault(false)
+                    val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
                     if (hasRoot) {
                         runCatching {
                             RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)}")
@@ -89,9 +89,10 @@ class RecordRepository(
     }
 
     /**
-     * Temizlikte kilit yarisini onler: dosyalar once gecici ada tasinir, DB satiri yalnizca
-     * kilit hala kapaliysa silinir. Kullanici bu arada "Korumaya Al" derse satir silinmez
-     * ve dosyalar geri tasinarak kilitli kayit dosyasiz birakilmaz.
+     * Temizlikte kilit yarisini onler: once kosullu DB silme yapilir; kilit bu arada
+     * kapatilmissa satir silinir ve dosyalar best effort silinir. Quarantine/geri tasinma
+     * penceresi yoktur, boylece surec cokerse kayit dosyasiz kalmaz ve artik dosya kalintisi
+     * kayit satiri olmadan geride birakilmaz.
      */
     private suspend fun purgeRecord(current: CallRecord): Boolean = withContext(Dispatchers.IO) {
         val files = listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath)
@@ -104,50 +105,16 @@ class RecordRepository(
             throw IOException("Kayıt dosyası silinemedi")
         }
 
-        val quarantined = mutableListOf<Pair<File, File>>()
-        try {
-            for (file in files) {
-                val temp = File(file.parentFile, "${file.name}.purge_${System.nanoTime()}")
-                if (!moveFile(file, temp)) {
-                    throw IOException("Kayıt dosyası silinemedi")
-                }
-                quarantined.add(file to temp)
-            }
-            val removed = callRecordDao.deleteUnlockedRecordById(current.id)
-            if (removed > 0) {
-                for ((_, temp) in quarantined) {
-                    deleteFileQuietly(temp)
-                }
-                true
-            } else {
-                // Kayit bu arada kilitlendi: dosyalar geri tasinir, kayit delil olarak korunur.
-                for ((original, temp) in quarantined) {
-                    if (!moveFile(temp, original)) {
-                        runCatching { Log.w(TAG, "Kilitlenen kaydin dosyasi geri tasinamadi: ${original.name}") }
-                    }
-                }
-                false
-            }
-        } catch (e: Exception) {
-            for ((original, temp) in quarantined) {
-                moveFile(temp, original)
-            }
-            throw if (e is IOException) e else IOException("Kayıt temizlenemedi: ${e.message}", e)
+        val removed = callRecordDao.deleteUnlockedRecordById(current.id)
+        if (removed == 0) {
+            Log.w(TAG, "Kayit kilitli veya zaten silinmis, dosyalara dokunulmuyor (ID=${current.id})")
+            return@withContext false
         }
-    }
 
-    private fun moveFile(from: File, to: File): Boolean {
-        if (!from.exists()) return true
-        if (from.renameTo(to)) return true
-        val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
-        if (hasRoot) {
-            runCatching {
-                RootShellManager.execute(
-                    "mv -f ${RootShellManager.shellQuote(from.absolutePath)} ${RootShellManager.shellQuote(to.absolutePath)} 2>/dev/null"
-                )
-            }
+        for (file in files) {
+            deleteFileQuietly(file)
         }
-        return !from.exists() && to.exists()
+        true
     }
 
     private fun deleteFileQuietly(file: File) {
