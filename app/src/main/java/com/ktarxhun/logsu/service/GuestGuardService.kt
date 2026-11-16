@@ -3,6 +3,8 @@ package com.ktarxhun.logsu.service
 import android.Manifest
 import android.app.Notification
 import android.app.Service
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.*
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
@@ -21,6 +23,7 @@ import com.ktarxhun.logsu.LogSuApp
 import com.ktarxhun.logsu.data.model.GuestEvent
 import com.ktarxhun.logsu.data.model.GuestEventType
 import com.ktarxhun.logsu.root.AudioCaptureController
+import com.ktarxhun.logsu.root.RootShellManager
 import com.ktarxhun.logsu.root.ScreenRecordController
 import com.ktarxhun.logsu.root.TouchCaptureController
 import kotlinx.coroutines.CoroutineScope
@@ -29,8 +32,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
@@ -46,6 +51,13 @@ class GuestGuardService : Service() {
         const val ACTION_START_GUARD = "com.ktarxhun.logsu.ACTION_START_GUARD"
         const val ACTION_STOP_GUARD = "com.ktarxhun.logsu.ACTION_STOP_GUARD"
         private const val PERIODIC_PHOTO_INTERVAL_MS = 45000L
+        private val TRANSIENT_SYSTEM_PACKAGES = setOf(
+            "android",
+            "com.android.systemui",
+            "com.google.android.inputmethod.latin",
+            "com.miui.securitycenter"
+        )
+        private val RESUMED_PKG_REGEX = Regex("""([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+)/""")
 
         private val _isSessionActiveFlow = MutableStateFlow(false)
         val isSessionActiveFlow = _isSessionActiveFlow.asStateFlow()
@@ -118,6 +130,7 @@ class GuestGuardService : Service() {
     private val touchController = TouchCaptureController()
     private val audioController = AudioCaptureController()
     private var stopSessionJob: Job? = null
+    private var foregroundWatchJob: Job? = null
 
     private var clipboardManager: ClipboardManager? = null
     private var clipboardListener: ClipboardManager.OnPrimaryClipChangedListener? = null
@@ -266,6 +279,13 @@ class GuestGuardService : Service() {
             screenController.setScreenInteractive(isInteractive)
 
             touchController.startCapture(tFile, sessionStartTime)
+            if (RootShellManager.isRootAvailable()) {
+                RootShellManager.execute("appops set ${RootShellManager.shellQuote(packageName)} GET_USAGE_STATS allow 2>/dev/null")
+            }
+            foregroundWatchJob?.cancel()
+            foregroundWatchJob = serviceScope.launch {
+                watchForegroundApps()
+            }
             coroutineScope {
                 launch { screenController.startRecording(this@GuestGuardService, vFile) }
                 launch { audioController.startRecording(aFile, enableDualInternalMic = true) }
@@ -278,6 +298,8 @@ class GuestGuardService : Service() {
         getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
         SystemProtectionTileService.requestRefresh(this)
 
+        foregroundWatchJob?.cancel()
+        foregroundWatchJob = null
         cameraHandler?.removeCallbacksAndMessages(null)
         unregisterScreenReceiver()
         removeClipboardListener()
@@ -603,7 +625,68 @@ class GuestGuardService : Service() {
             .build()
     }
 
+    private suspend fun watchForegroundApps() {
+        var lastForegroundPkg: String? = null
+        val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+        val powerManager = getSystemService(PowerManager::class.java)
+
+        while (serviceScope.isActive && _isSessionActiveFlow.value) {
+            delay(2000L)
+            if (powerManager?.isInteractive == false) continue
+
+            var detectedPkg: String? = null
+            if (usageStatsManager != null) {
+                runCatching {
+                    val now = System.currentTimeMillis()
+                    val events = usageStatsManager.queryEvents(now - 5000L, now)
+                    val ev = UsageEvents.Event()
+                    while (events.hasNextEvent()) {
+                        events.getNextEvent(ev)
+                        val isResumed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED
+                        } else {
+                            @Suppress("DEPRECATION")
+                            ev.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND
+                        }
+                        if (isResumed && !ev.packageName.isNullOrBlank()) {
+                            detectedPkg = ev.packageName
+                        }
+                    }
+                }
+            }
+
+            if (detectedPkg.isNullOrBlank() && RootShellManager.isRootAvailable()) {
+                val out = RootShellManager.executeSingle(
+                    "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity' | head -n 1"
+                )
+                detectedPkg = RESUMED_PKG_REGEX.find(out)?.groupValues?.getOrNull(1)
+            }
+
+            val pkg = detectedPkg
+            if (!pkg.isNullOrBlank() &&
+                pkg != lastForegroundPkg &&
+                pkg !in TRANSIENT_SYSTEM_PACKAGES &&
+                pkg != packageName &&
+                !pkg.contains("inputmethod", ignoreCase = true)
+            ) {
+                lastForegroundPkg = pkg
+                handleAppOpened(pkg, resolveAppLabel(pkg))
+            }
+        }
+    }
+
+    private fun resolveAppLabel(pkg: String): String {
+        return try {
+            val info = packageManager.getApplicationInfo(pkg, 0)
+            packageManager.getApplicationLabel(info).toString()
+        } catch (_: Exception) {
+            pkg
+        }
+    }
+
     override fun onDestroy() {
+        foregroundWatchJob?.cancel()
+        foregroundWatchJob = null
         cameraHandler?.removeCallbacksAndMessages(null)
         unregisterScreenReceiver()
         removeClipboardListener()

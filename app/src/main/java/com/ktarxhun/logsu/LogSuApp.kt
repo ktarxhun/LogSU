@@ -4,18 +4,28 @@ import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Context
+import android.media.AudioManager
+import android.os.Build
+import android.telephony.TelephonyManager
+import androidx.core.content.ContextCompat
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.ktarxhun.logsu.data.db.LogSuDatabase
+import com.ktarxhun.logsu.data.model.CallType
 import com.ktarxhun.logsu.data.repository.RecordRepository
+import com.ktarxhun.logsu.service.CallMonitorService
 import com.ktarxhun.logsu.service.GuestGuardService
 import com.ktarxhun.logsu.service.RetentionWorker
 import com.ktarxhun.logsu.ui.auth.AppSessionLock
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.TimeUnit
 
@@ -29,6 +39,9 @@ class LogSuApp : Application() {
     }
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var voipStartJob: Job? = null
+    @Volatile
+    private var isVoipCallActive = false
     val database by lazy { LogSuDatabase.getDatabase(this) }
     val repository by lazy { RecordRepository(database.callRecordDao(), database.guestSessionDao(), database.guestEventDao()) }
 
@@ -51,6 +64,55 @@ class LogSuApp : Application() {
         if (!GuestGuardService.isSessionActive) {
             appScope.launch {
                 runCatching { repository.closeOrphanedGuestSessions() }
+            }
+        }
+        setupVoipAudioModeWatcher()
+    }
+
+    private fun setupVoipAudioModeWatcher() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.addOnModeChangedListener(ContextCompat.getMainExecutor(this)) { mode ->
+                handleAudioModeChanged(mode, audioManager)
+            }
+        } else {
+            appScope.launch {
+                var lastMode = audioManager.mode
+                while (isActive) {
+                    delay(1500L)
+                    val currentMode = audioManager.mode
+                    if (currentMode != lastMode) {
+                        lastMode = currentMode
+                        handleAudioModeChanged(currentMode, audioManager)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleAudioModeChanged(mode: Int, audioManager: AudioManager) {
+        if (mode == AudioManager.MODE_IN_COMMUNICATION) {
+            if (isVoipCallActive) return
+            voipStartJob?.cancel()
+            voipStartJob = appScope.launch {
+                delay(600L)
+                if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) return@launch
+                val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+                val isGsmIdle = runCatching {
+                    @Suppress("DEPRECATION")
+                    tm?.callState == TelephonyManager.CALL_STATE_IDLE
+                }.getOrDefault(true)
+                if (isGsmIdle && !isVoipCallActive) {
+                    isVoipCallActive = true
+                    CallMonitorService.startCall(this@LogSuApp, "WhatsApp Görüşmesi", CallType.WHATSAPP_CALL)
+                }
+            }
+        } else {
+            voipStartJob?.cancel()
+            voipStartJob = null
+            if (isVoipCallActive) {
+                isVoipCallActive = false
+                CallMonitorService.stopCall(this@LogSuApp)
             }
         }
     }

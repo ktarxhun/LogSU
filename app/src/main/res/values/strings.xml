@@ -1,5 +1,4 @@
 <resources>
     <string name="app_name">LogSU</string>
     <string name="tile_system_protection">Koruma</string>
-    <string name="accessibility_service_desc">LogSU arama ve sistem güvenlik servisi</string>
 </resources>

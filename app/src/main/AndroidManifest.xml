@@ -17,6 +17,7 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING" tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
 
     <!-- Ön Plan Servis İzinleri (Android 14+ uyumlu) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -102,20 +103,6 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Emanet modu koruma ve sistem izleme servisi" />
-        </service>
-
-        <!-- WhatsApp Arama ve Uygulama İzleme Erişilebilirlik Servisi -->
-        <service
-            android:name=".service.VoipAccessibilityService"
-            android:exported="true"
-            android:label="@string/accessibility_service_desc"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
         </service>
 
         <!-- GSM Çağrı Yayın Alıcısı -->
