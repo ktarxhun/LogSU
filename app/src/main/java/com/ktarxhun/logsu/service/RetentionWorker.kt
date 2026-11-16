@@ -28,7 +28,7 @@ class RetentionWorker(
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Temizlik sirasinda hata olustu", e)
-            Result.retry()
+            if (runAttemptCount >= 3) Result.failure() else Result.retry()
         }
     }
 }

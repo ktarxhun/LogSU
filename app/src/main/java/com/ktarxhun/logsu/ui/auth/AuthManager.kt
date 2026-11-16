@@ -12,6 +12,23 @@ object AuthManager {
         onSuccess: () -> Unit,
         onError: (String) -> Unit
     ) {
+        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+
+        val canAuth = BiometricManager.from(activity).canAuthenticate(authenticators)
+        if (canAuth != BiometricManager.BIOMETRIC_SUCCESS) {
+            val reason = when (canAuth) {
+                BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED ->
+                    "Cihazda parmak izi veya kilit ekranı (PIN/şifre) tanımlı değil."
+                BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,
+                BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE ->
+                    "Biyometrik donanım veya cihaz doğrulaması kullanılamıyor."
+                else -> "Cihaz doğrulama mekanizması hazır değil ($canAuth)."
+            }
+            onError(reason)
+            return
+        }
+
         val executor = ContextCompat.getMainExecutor(activity)
         val prompt = BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
@@ -27,12 +44,13 @@ object AuthManager {
 
         val promptInfo = BiometricPrompt.PromptInfo.Builder()
             .setTitle("LogSU")
-            .setAllowedAuthenticators(
-                BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            )
+            .setAllowedAuthenticators(authenticators)
             .build()
 
-        prompt.authenticate(promptInfo)
+        try {
+            prompt.authenticate(promptInfo)
+        } catch (e: Exception) {
+            onError(e.message ?: "Kimlik doğrulama başlatılamadı.")
+        }
     }
 }

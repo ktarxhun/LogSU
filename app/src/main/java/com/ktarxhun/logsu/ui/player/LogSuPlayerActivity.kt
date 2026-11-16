@@ -70,7 +70,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.IOException
 
 class LogSuPlayerActivity : FragmentActivity() {
 
@@ -458,7 +457,7 @@ fun CallAudioPlayerScreen(
                         exoPlayer.stop()
                         LogSuApp.instance.repository.deleteCallRecord(target)
                         onBack()
-                    } catch (e: IOException) {
+                    } catch (e: Exception) {
                         Toast.makeText(context, "Dosya silinemedi, tekrar deneyin.", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -747,6 +746,11 @@ fun GuestSessionPlayerScreen(
                                         resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FILL
                                     }
                                 },
+                                update = { view ->
+                                    if (view.player !== exoPlayer) {
+                                        view.player = exoPlayer
+                                    }
+                                },
                                 modifier = Modifier.fillMaxSize()
                             )
 
@@ -783,14 +787,17 @@ fun GuestSessionPlayerScreen(
                                 session?.videoFilePath?.let { vPath ->
                                     isExporting = true
                                     scope.launch {
-                                        val aFile = session?.audioFilePath?.let { File(it) }
-                                        GalleryExporter.exportVideoToGallery(
-                                            context = context,
-                                            videoFile = File(vPath),
-                                            audioFile = aFile,
-                                            customName = "LogSU_Emanet_Oturum_${session?.id}"
-                                        )
-                                        isExporting = false
+                                        try {
+                                            val aFile = session?.audioFilePath?.let { File(it) }
+                                            GalleryExporter.exportVideoToGallery(
+                                                context = context,
+                                                videoFile = File(vPath),
+                                                audioFile = aFile,
+                                                customName = "LogSU_Emanet_Oturum_${session?.id}"
+                                            )
+                                        } finally {
+                                            isExporting = false
+                                        }
                                     }
                                 }
                             }
@@ -841,7 +848,7 @@ fun GuestSessionPlayerScreen(
                         exoPlayer.stop()
                         LogSuApp.instance.repository.deleteGuestSession(target)
                         onBack()
-                    } catch (e: IOException) {
+                    } catch (e: Exception) {
                         Toast.makeText(context, "Dosyalar silinemedi, tekrar deneyin.", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -864,8 +871,8 @@ private fun TouchOverlayCanvas(
         if (touchEvents.isEmpty()) return@Canvas
         for (touch in touchEvents) {
             if (touch.action == 0 && Math.abs(touch.timestampMs - currentPlaybackMs) <= 120L) {
-                val cx = (touch.x / 1079f) * size.width
-                val cy = (touch.y / 2399f) * size.height
+                val cx = (touch.x / 1079f).coerceIn(0f, 1f) * size.width
+                val cy = (touch.y / 2399f).coerceIn(0f, 1f) * size.height
 
                 drawCircle(
                     color = AccentSecondary.copy(alpha = 0.5f),

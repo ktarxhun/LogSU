@@ -28,11 +28,15 @@ object FormatUtils {
 
     fun formatDurationSeconds(seconds: Long): String {
         val safe = seconds.coerceAtLeast(0L)
-        return String.format(Locale.US, "%02d:%02d", safe / 60L, safe % 60L)
+        return if (safe >= 3600L) {
+            String.format(Locale.US, "%02d:%02d:%02d", safe / 3600L, (safe % 3600L) / 60L, safe % 60L)
+        } else {
+            String.format(Locale.US, "%02d:%02d", safe / 60L, safe % 60L)
+        }
     }
 
     fun formatDurationMillis(ms: Long): String {
         val totalSec = (ms / 1000L).coerceAtLeast(0L)
-        return String.format(Locale.US, "%02d:%02d", totalSec / 60L, totalSec % 60L)
+        return formatDurationSeconds(totalSec)
     }
 }

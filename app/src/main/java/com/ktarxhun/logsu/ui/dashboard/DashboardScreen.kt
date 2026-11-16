@@ -29,7 +29,6 @@ import com.ktarxhun.logsu.service.CallMonitorService
 import com.ktarxhun.logsu.ui.settings.SettingsDialog
 import com.ktarxhun.logsu.ui.theme.*
 import kotlinx.coroutines.launch
-import java.io.IOException
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -190,7 +189,7 @@ fun DashboardScreen(context: Context, permissionsReady: Boolean = true) {
                             scope.launch {
                                 try {
                                     LogSuApp.instance.repository.deleteCallRecord(record)
-                                } catch (e: IOException) {
+                                } catch (e: Exception) {
                                     Toast.makeText(context, "Dosyalar silinemedi. Kayıt korundu, tekrar deneyin.", Toast.LENGTH_LONG).show()
                                 }
                             }
@@ -204,7 +203,7 @@ fun DashboardScreen(context: Context, permissionsReady: Boolean = true) {
                             scope.launch {
                                 try {
                                     LogSuApp.instance.repository.deleteCallRecord(record)
-                                } catch (e: IOException) {
+                                } catch (e: Exception) {
                                     Toast.makeText(context, "Dosyalar silinemedi. Kayıt korundu, tekrar deneyin.", Toast.LENGTH_LONG).show()
                                 }
                             }
@@ -219,7 +218,7 @@ fun DashboardScreen(context: Context, permissionsReady: Boolean = true) {
                             scope.launch {
                                 try {
                                     LogSuApp.instance.repository.deleteGuestSession(session)
-                                } catch (e: IOException) {
+                                } catch (e: Exception) {
                                     Toast.makeText(context, "Dosyalar silinemedi. Kayıt korundu, tekrar deneyin.", Toast.LENGTH_LONG).show()
                                 }
                             }

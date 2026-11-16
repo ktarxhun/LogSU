@@ -55,6 +55,7 @@ object RootDisplayRecorder {
         var iDisplayManager: Any? = null
         var releaseDisplayMethod: java.lang.reflect.Method? = null
         var callbackObj: Any? = null
+        var exitCode = 0
 
         try {
             File(outputPath).parentFile?.mkdirs()
@@ -178,7 +179,7 @@ object RootDisplayRecorder {
             }
         } catch (t: Throwable) {
             t.printStackTrace(System.err)
-            exitProcess(1)
+            exitCode = 1
         } finally {
             try {
                 if (iDisplayManager != null && callbackObj != null && releaseDisplayMethod != null) {
@@ -220,7 +221,7 @@ object RootDisplayRecorder {
             } catch (_: Throwable) {
             }
         }
-        exitProcess(0)
+        exitProcess(exitCode)
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)

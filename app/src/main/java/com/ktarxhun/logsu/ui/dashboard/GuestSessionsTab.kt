@@ -114,23 +114,30 @@ fun GuestSessionsTab(
                             context.startActivity(intent)
                         },
                         onExportToGallery = {
-                            if (exportingSessionId == null) {
+                            if (exportingSessionId == null && !session.isActive) {
                                 session.videoFilePath?.let { vPath ->
                                     exportingSessionId = session.id
                                     scope.launch {
-                                        val aFile = session.audioFilePath?.let { File(it) }
-                                        GalleryExporter.exportVideoToGallery(
-                                            context = context,
-                                            videoFile = File(vPath),
-                                            audioFile = aFile,
-                                            customName = "LogSU_Emanet_Oturum_${session.id}"
-                                        )
-                                        exportingSessionId = null
+                                        try {
+                                            val aFile = session.audioFilePath?.let { File(it) }
+                                            GalleryExporter.exportVideoToGallery(
+                                                context = context,
+                                                videoFile = File(vPath),
+                                                audioFile = aFile,
+                                                customName = "LogSU_Emanet_Oturum_${session.id}"
+                                            )
+                                        } finally {
+                                            exportingSessionId = null
+                                        }
                                     }
                                 }
                             }
                         },
-                        onDelete = { sessionToDelete = session }
+                        onDelete = {
+                            if (!session.isActive) {
+                                sessionToDelete = session
+                            }
+                        }
                     )
                 }
             }
@@ -218,17 +225,25 @@ fun GuestSessionCard(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 if (session.videoFilePath != null) {
-                    IconButton(onClick = onExportToGallery, enabled = !isExporting) {
+                    IconButton(onClick = onExportToGallery, enabled = !isExporting && !session.isActive) {
                         if (isExporting) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = AccentGreen)
                         } else {
-                            Icon(Icons.Default.Movie, contentDescription = "Galeriye Kaydet", tint = AccentPrimary)
+                            Icon(
+                                Icons.Default.Movie,
+                                contentDescription = "Galeriye Kaydet",
+                                tint = if (session.isActive) TextSecondary.copy(alpha = 0.4f) else AccentPrimary
+                            )
                         }
                     }
                 }
 
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Default.Delete, contentDescription = "Sil", tint = AccentRed.copy(alpha = 0.85f))
+                IconButton(onClick = onDelete, enabled = !session.isActive) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Sil",
+                        tint = if (session.isActive) TextSecondary.copy(alpha = 0.4f) else AccentRed.copy(alpha = 0.85f)
+                    )
                 }
 
                 Button(

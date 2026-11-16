@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
+import java.util.Locale
 
 object OfflineSpeechTranscriber {
     private const val TAG = "OfflineTranscriber"
@@ -13,10 +14,13 @@ object OfflineSpeechTranscriber {
      * Mono veya stereo WAV dosyasını ayrıştırarak sol (Sen) ve sağ (Karşı Taraf) kanallarının
      * ses enerjisini ve konuşma parçalarını yerel olarak çözümler.
      */
-    suspend fun transcribeCall(wavFile: File, onComplete: (String) -> Unit) = withContext(Dispatchers.IO) {
+    suspend fun transcribeCall(wavFile: File, onComplete: (String) -> Unit) {
+        onComplete(transcribeCallSuspend(wavFile))
+    }
+
+    suspend fun transcribeCallSuspend(wavFile: File): String = withContext(Dispatchers.IO) {
         if (!wavFile.exists() || wavFile.length() <= 44) {
-            onComplete("")
-            return@withContext
+            return@withContext ""
         }
 
         try {
@@ -26,8 +30,7 @@ object OfflineSpeechTranscriber {
                 val header = ByteArray(44)
                 val headerRead = fis.read(header)
                 if (headerRead < 44) {
-                    onComplete("")
-                    return@withContext
+                    return@withContext ""
                 }
 
                 val channels = ((header[22].toInt() and 0xFF) or ((header[23].toInt() and 0xFF) shl 8)).coerceIn(1, 2)
@@ -38,7 +41,7 @@ object OfflineSpeechTranscriber {
                 val frameBytes = channels * 2
 
                 val buffer = ByteArray(4096)
-                var bytesRead = fis.read(buffer)
+                var carryOver = 0
                 var sampleIndex = 0L
 
                 val transcriptBuilder = StringBuilder()
@@ -47,13 +50,20 @@ object OfflineSpeechTranscriber {
                 var leftSpeaking = false
                 var rightSpeaking = false
 
-                while (bytesRead > 0) {
+                while (true) {
+                    val readNow = fis.read(buffer, carryOver, buffer.size - carryOver)
+                    if (readNow <= 0) break
+
+                    val totalBytes = carryOver + readNow
+                    val usableBytes = (totalBytes / frameBytes) * frameBytes
+                    val remainder = totalBytes - usableBytes
+
                     var leftEnergy = 0L
                     var rightEnergy = 0L
                     var frames = 0
                     var i = 0
 
-                    while (i <= bytesRead - frameBytes) {
+                    while (i < usableBytes) {
                         val leftSample = (buffer[i].toInt() and 0xFF) or (buffer[i + 1].toInt() shl 8)
                         leftEnergy += Math.abs(leftSample.toShort().toLong())
                         if (channels == 2) {
@@ -65,6 +75,11 @@ object OfflineSpeechTranscriber {
                         frames++
                     }
 
+                    if (remainder > 0) {
+                        System.arraycopy(buffer, usableBytes, buffer, 0, remainder)
+                    }
+                    carryOver = remainder
+
                     if (frames > 0) {
                         val currentSec = sampleIndex / sampleRate
                         val threshold = 1500L * frames
@@ -74,7 +89,7 @@ object OfflineSpeechTranscriber {
 
                         if (nowLeft && !leftSpeaking) {
                             leftSpeaking = true
-                            val timeTag = String.format("[%02d:%02d]", currentSec / 60, currentSec % 60)
+                            val timeTag = String.format(Locale.US, "[%02d:%02d]", currentSec / 60, currentSec % 60)
                             val label = if (channels == 1) "[Mikrofon]" else "[Sen]"
                             transcriptBuilder.append("$timeTag $label: (Ses algılandı)\n")
                         } else if (!nowLeft && leftSpeaking) {
@@ -83,14 +98,12 @@ object OfflineSpeechTranscriber {
 
                         if (nowRight && !rightSpeaking) {
                             rightSpeaking = true
-                            val timeTag = String.format("[%02d:%02d]", currentSec / 60, currentSec % 60)
+                            val timeTag = String.format(Locale.US, "[%02d:%02d]", currentSec / 60, currentSec % 60)
                             transcriptBuilder.append("$timeTag [Karşı Taraf]: (Ses algılandı)\n")
                         } else if (!nowRight && rightSpeaking) {
                             rightSpeaking = false
                         }
                     }
-
-                    bytesRead = fis.read(buffer)
                 }
 
                 if (transcriptBuilder.length <= 40) {
@@ -99,11 +112,11 @@ object OfflineSpeechTranscriber {
 
                 val finalTranscript = transcriptBuilder.toString()
                 Log.i(TAG, "Lokal transkripsiyon tamamlandi.")
-                onComplete(finalTranscript)
+                finalTranscript
             }
         } catch (e: Exception) {
             Log.e(TAG, "Transkripsiyon hatasi", e)
-            onComplete("[Hata]: Ses transkripsiyonu tamamlanamadı.")
+            "[Hata]: Ses transkripsiyonu tamamlanamadı."
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.ktarxhun.logsu.root
 
+import android.os.SystemClock
 import android.util.Log
 import com.ktarxhun.logsu.data.model.TouchEvent
 import kotlinx.coroutines.*
@@ -27,11 +28,25 @@ class TouchCaptureController {
 
         captureJob = CoroutineScope(Dispatchers.IO).launch {
             try {
-                val touchDevice = RootShellManager.findTouchDevice() ?: "/dev/input/event1"
+                val touchDevice = RootShellManager.findTouchDevice()
+                if (touchDevice == null) {
+                    Log.w(TAG, "Dokunmatik giris aygiti bulunamadi, dokunma kaydi devre disi birakildi")
+                    isCapturing = false
+                    return@launch
+                }
                 Log.i(TAG, "Dokunma yakalama baslatildi, aygit: $touchDevice, cikti: ${outputTouchFile.absolutePath}")
-                val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "getevent -l $touchDevice"))
+                val proc = ProcessBuilder(
+                    "su",
+                    "-c",
+                    "getevent -l ${RootShellManager.shellQuote(touchDevice)}"
+                )
+                    .redirectErrorStream(true)
+                    .start()
                 process = proc
                 val reader = BufferedReader(InputStreamReader(proc.inputStream))
+
+                val initialOffsetMs = (System.currentTimeMillis() - startTimeMs).coerceAtLeast(0L)
+                val captureBaseElapsedMs = SystemClock.elapsedRealtime()
 
                 var currentX = 0f
                 var currentY = 0f
@@ -59,7 +74,7 @@ class TouchCaptureController {
                                 else if (trimmed.contains("UP")) isDown = false
                             } else if (trimmed.contains("SYN_REPORT")) {
                                 if (isDown || wasDown) {
-                                    val relTime = System.currentTimeMillis() - startTimeMs
+                                    val relTime = initialOffsetMs + (SystemClock.elapsedRealtime() - captureBaseElapsedMs)
                                     val action = if (isDown) 0 else 1
                                     val event = TouchEvent(relTime, currentX, currentY, action)
                                     writer.write(event.toLogLine())
@@ -77,7 +92,10 @@ class TouchCaptureController {
                     Log.e(TAG, "Dokunma yakalama okuma hatasi", e)
                 }
             } finally {
-                process?.destroy()
+                process?.let { proc ->
+                    runCatching { proc.destroy() }
+                    if (proc.isAlive) runCatching { proc.destroyForcibly() }
+                }
                 process = null
             }
         }
@@ -88,7 +106,10 @@ class TouchCaptureController {
         isCapturing = false
 
         try {
-            process?.destroy()
+            process?.let { proc ->
+                runCatching { proc.destroy() }
+                if (proc.isAlive) runCatching { proc.destroyForcibly() }
+            }
             process = null
             captureJob?.cancel()
         } catch (e: Exception) {

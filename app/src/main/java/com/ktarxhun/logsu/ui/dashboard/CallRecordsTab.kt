@@ -96,14 +96,16 @@ fun CallRecordsTab(
                                 record.audioFilePath?.let { audioPath ->
                                     exportingRecordId = record.id
                                     scope.launch {
-                                        val title = record.contactName ?: record.phoneNumber
-                                        val subtitle = FormatUtils.formatShortDate(record.startTime)
-                                        GalleryExporter.exportAudioAsVideoToGallery(
-                                            context = context,
-                                            audioFile = File(audioPath),
-                                            title = title,
-                                            subtitle = subtitle
-                                        ) { _, _ ->
+                                        try {
+                                            val title = record.contactName ?: record.phoneNumber
+                                            val subtitle = FormatUtils.formatShortDate(record.startTime)
+                                            GalleryExporter.exportAudioAsVideoToGallery(
+                                                context = context,
+                                                audioFile = File(audioPath),
+                                                title = title,
+                                                subtitle = subtitle
+                                            ) { _, _ -> }
+                                        } finally {
                                             exportingRecordId = null
                                         }
                                     }

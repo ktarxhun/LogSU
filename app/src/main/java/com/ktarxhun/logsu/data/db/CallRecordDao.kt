@@ -42,4 +42,7 @@ interface CallRecordDao {
 
     @Query("DELETE FROM call_records WHERE id IN (:ids)")
     suspend fun deleteRecordsByIds(ids: List<Long>)
+
+    @Query("DELETE FROM call_records WHERE id = :id AND isLocked = 0")
+    suspend fun deleteUnlockedRecordById(id: Long): Int
 }

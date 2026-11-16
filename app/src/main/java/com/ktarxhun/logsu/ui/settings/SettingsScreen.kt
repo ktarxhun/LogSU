@@ -71,8 +71,12 @@ fun SettingsDialog(
                 Button(
                     onClick = {
                         scope.launch {
-                            val count = LogSuApp.instance.repository.purgeOldRecords()
-                            purgeStatus = "$count adet süresi dolan arama temizlendi."
+                            try {
+                                val count = LogSuApp.instance.repository.purgeOldRecords()
+                                purgeStatus = "$count adet süresi dolan arama temizlendi."
+                            } catch (e: Exception) {
+                                purgeStatus = "Temizleme başarısız: ${e.message ?: "Bilinmeyen hata"}"
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = DarkSurfaceVariant),

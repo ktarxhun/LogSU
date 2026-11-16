@@ -134,13 +134,15 @@ fun AmbientRecordsTab(
                                 record.audioFilePath?.let { audioPath ->
                                     exportingRecordId = record.id
                                     scope.launch {
-                                        val dateStr = FormatUtils.formatShortDate(record.startTime)
-                                        GalleryExporter.exportAudioAsVideoToGallery(
-                                            context = context,
-                                            audioFile = File(audioPath),
-                                            title = "Ses Kaydı #${record.id}",
-                                            subtitle = dateStr
-                                        ) { _, _ ->
+                                        try {
+                                            val dateStr = FormatUtils.formatShortDate(record.startTime)
+                                            GalleryExporter.exportAudioAsVideoToGallery(
+                                                context = context,
+                                                audioFile = File(audioPath),
+                                                title = "Ses Kaydı #${record.id}",
+                                                subtitle = dateStr
+                                            ) { _, _ -> }
+                                        } finally {
                                             exportingRecordId = null
                                         }
                                     }

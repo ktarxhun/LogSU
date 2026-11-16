@@ -1,10 +1,12 @@
 package com.ktarxhun.logsu.service
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 
+@SuppressLint("CustomSplashScreen")
 class GuardTileLaunchActivity : Activity() {
 
     private var hasStarted = false
@@ -16,6 +18,10 @@ class GuardTileLaunchActivity : Activity() {
             return
         }
         hasStarted = true
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+        }
 
         window.addFlags(
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or

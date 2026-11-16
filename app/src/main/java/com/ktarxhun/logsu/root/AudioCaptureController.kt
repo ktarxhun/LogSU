@@ -57,10 +57,17 @@ class AudioCaptureController {
                 return false
             }
 
+            try {
+                micOnly.startRecording()
+            } catch (e: Exception) {
+                Log.e(TAG, "Ortam mikrofonu startRecording hatasi: ${e.message}")
+                runCatching { micOnly.release() }
+                return false
+            }
+
             audioRecord = micOnly
             recordedChannels = 1
             isRecording = true
-            micOnly.startRecording()
 
             recordingJob = CoroutineScope(Dispatchers.IO).launch {
                 writePcmToWav(micOnly, targetWavFile, monoBufSize)
@@ -90,8 +97,15 @@ class AudioCaptureController {
         )
 
         if (micRec != null) {
+            try {
+                micRec.startRecording()
+            } catch (e: Exception) {
+                Log.e(TAG, "Mikrofon startRecording hatasi: ${e.message}")
+                runCatching { micRec.release() }
+                runCatching { intRec?.release() }
+                return false
+            }
             audioRecord = micRec
-            micRec.startRecording()
 
             var startedIntRec: AudioRecord? = null
             if (intRec != null) {
@@ -195,10 +209,17 @@ class AudioCaptureController {
             return false
         }
 
+        try {
+            fallbackRecord.startRecording()
+        } catch (e: Exception) {
+            Log.e(TAG, "Yedek stereo startRecording hatasi: ${e.message}")
+            runCatching { fallbackRecord.release() }
+            return false
+        }
+
         audioRecord = fallbackRecord
         recordedChannels = 2
         isRecording = true
-        fallbackRecord.startRecording()
 
         recordingJob = CoroutineScope(Dispatchers.IO).launch {
             writePcmToWav(fallbackRecord, targetWavFile, stereoBufSize)

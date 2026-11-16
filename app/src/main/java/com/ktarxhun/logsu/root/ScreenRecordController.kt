@@ -65,6 +65,8 @@ class ScreenRecordController {
             val width = sizeParts.getOrNull(0)?.toIntOrNull() ?: 1080
             val height = sizeParts.getOrNull(1)?.toIntOrNull() ?: 2400
 
+            val nativeTimeLimitArg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) "0" else "180"
+
             supervisorJob = CoroutineScope(Dispatchers.IO).launch {
                 var partIdx = 0
                 var useVirtualDisplay = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !apkPath.isNullOrBlank()
@@ -87,15 +89,25 @@ class ScreenRecordController {
                     val usingDisplayRecorder = useVirtualDisplay
                     val cmd = if (usingDisplayRecorder) {
                         activeStopFile = stopFile
-                        "rm -f '${stopFile.absolutePath}'; CLASSPATH='$apkPath' app_process /system/bin com.ktarxhun.logsu.root.RootDisplayRecorder '${segFile.absolutePath}' $width $height $bitRate '${stopFile.absolutePath}' >/dev/null 2>'${errFile.absolutePath}' & echo \$!"
+                        "rm -f ${RootShellManager.shellQuote(stopFile.absolutePath)}; CLASSPATH=${RootShellManager.shellQuote(apkPath!!)} app_process /system/bin com.ktarxhun.logsu.root.RootDisplayRecorder ${RootShellManager.shellQuote(segFile.absolutePath)} $width $height $bitRate ${RootShellManager.shellQuote(stopFile.absolutePath)} >/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
                     } else {
                         activeStopFile = null
-                        val timeLimitArg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) "0" else "180"
-                        "screenrecord --bit-rate $bitRate --size $size --time-limit $timeLimitArg '${segFile.absolutePath}' >/dev/null 2>'${errFile.absolutePath}' & echo \$!"
+                        "screenrecord --bit-rate $bitRate --size $size --time-limit $nativeTimeLimitArg ${RootShellManager.shellQuote(segFile.absolutePath)} >/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
                     }
 
                     val pidStr = RootShellManager.executeSingle(cmd).trim()
                     val pid = pidStr.lines().lastOrNull()?.trim()?.toIntOrNull() ?: -1
+
+                    if (!shouldRecord || !isActive) {
+                        if (pid > 0 || usingDisplayRecorder) {
+                            withContext(NonCancellable) {
+                                stopActiveRecorderProcess(pid, if (usingDisplayRecorder) stopFile else null)
+                            }
+                        }
+                        activeStopFile = null
+                        activePid = -1
+                        break
+                    }
 
                     if (pid <= 0) {
                         Log.e(TAG, "Ekran kaydi PID alinamadi: '$pidStr'")
@@ -188,6 +200,10 @@ class ScreenRecordController {
                     if (alive != "1") return@repeat
                     delay(50)
                 }
+                val forceCheck = RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim()
+                if (forceCheck == "1") {
+                    RootShellManager.execute("kill -9 $pid 2>/dev/null")
+                }
             } else {
                 delay(400)
             }
@@ -265,10 +281,11 @@ class ScreenRecordController {
 
     private fun mergeMp4Segments(segments: List<File>, outputFile: File): Boolean {
         var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var writtenSamples = 0
         try {
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             var videoTrackIndex = -1
-            var muxerStarted = false
             var timeOffsetUs = 0L
             val bufferInfo = MediaCodec.BufferInfo()
             val sampleBuf = ByteBuffer.allocate(2 * 1024 * 1024)
@@ -313,6 +330,7 @@ class ScreenRecordController {
 
                         bufferInfo.set(0, size, timeOffsetUs + ptsUs, codecFlags)
                         muxer.writeSampleData(videoTrackIndex, sampleBuf, bufferInfo)
+                        writtenSamples++
                         extractor.advance()
                     }
                     timeOffsetUs += lastSegPtsUs + 33333L
@@ -322,12 +340,15 @@ class ScreenRecordController {
                     extractor.release()
                 }
             }
-            return muxerStarted
+            return muxerStarted && writtenSamples > 0
         } catch (e: Exception) {
             Log.e(TAG, "MP4 segment birlestirme hatasi", e)
             return false
         } finally {
-            try { muxer?.stop(); muxer?.release() } catch (_: Exception) {}
+            if (muxerStarted && writtenSamples > 0) {
+                try { muxer?.stop() } catch (_: Exception) {}
+            }
+            try { muxer?.release() } catch (_: Exception) {}
         }
     }
 }

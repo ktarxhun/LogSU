@@ -1,11 +1,13 @@
 package com.ktarxhun.logsu.data.repository
 
+import android.util.Log
 import com.ktarxhun.logsu.data.db.CallRecordDao
 import com.ktarxhun.logsu.data.db.GuestEventDao
 import com.ktarxhun.logsu.data.db.GuestSessionDao
 import com.ktarxhun.logsu.data.model.CallRecord
 import com.ktarxhun.logsu.data.model.GuestEvent
 import com.ktarxhun.logsu.data.model.GuestSession
+import com.ktarxhun.logsu.root.RootShellManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
@@ -17,6 +19,10 @@ class RecordRepository(
     private val guestSessionDao: GuestSessionDao,
     private val guestEventDao: GuestEventDao
 ) {
+    companion object {
+        private const val TAG = "RecordRepository"
+    }
+
     val allCallRecords: Flow<List<CallRecord>> = callRecordDao.getAllRecordsFlow()
     val allGuestSessions: Flow<List<GuestSession>> = guestSessionDao.getAllSessionsFlow()
 
@@ -34,8 +40,21 @@ class RecordRepository(
         for (path in paths.filterNotNull().distinct()) {
             val file = File(path)
             // Eksik dosyalar tekrar denemeyi engellemez. Silinemeyen dosya varsa DB kaydı korunur.
-            if (file.exists() && (!file.isFile || !file.delete())) {
-                throw IOException("Kayıt dosyası silinemedi")
+            if (file.exists()) {
+                if (!file.isFile) {
+                    throw IOException("Kayıt dosyası silinemedi")
+                }
+                if (!file.delete()) {
+                    val hasRoot = runCatching { RootShellManager.isRootCached() }.getOrDefault(false)
+                    if (hasRoot) {
+                        runCatching {
+                            RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)}")
+                        }
+                    }
+                    if (file.exists()) {
+                        throw IOException("Kayıt dosyası silinemedi")
+                    }
+                }
             }
         }
     }
@@ -54,11 +73,21 @@ class RecordRepository(
         val toPurge = callRecordDao.getRecordsToPurge(
             now - contactDays * dayMillis, now - unknownDays * dayMillis
         )
+        var purgedCount = 0
         for (record in toPurge) {
-            // Her başarılı silme ayrı tamamlanır; sonraki hata önceki satırları yetim bırakmaz.
-            deleteCallRecord(record)
+            val current = callRecordDao.getRecordById(record.id) ?: continue
+            if (current.isLocked) continue
+            try {
+                deleteFiles(listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath))
+                val removed = callRecordDao.deleteUnlockedRecordById(current.id)
+                if (removed > 0) {
+                    purgedCount++
+                }
+            } catch (e: IOException) {
+                runCatching { Log.w(TAG, "Kayit temizlenemedi (ID=${current.id}): ${e.message}") }
+            }
         }
-        return toPurge.size
+        return purgedCount
     }
 
     // Emanet Oturumu Fonksiyonları
@@ -71,6 +100,10 @@ class RecordRepository(
 
     suspend fun closeActiveGuestSession(sessionId: Long) {
         guestSessionDao.closeSession(sessionId, System.currentTimeMillis())
+    }
+
+    suspend fun closeOrphanedGuestSessions() {
+        guestSessionDao.closeAllActiveSessions(System.currentTimeMillis())
     }
 
     suspend fun getGuestSessionById(id: Long): GuestSession? = guestSessionDao.getSessionById(id)

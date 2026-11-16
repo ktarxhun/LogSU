@@ -26,4 +26,7 @@ interface GuestSessionDao {
 
     @Query("UPDATE guest_sessions SET isActive = 0, endTime = :endTime WHERE id = :id")
     suspend fun closeSession(id: Long, endTime: Long)
+
+    @Query("UPDATE guest_sessions SET isActive = 0, endTime = :endTime WHERE isActive = 1")
+    suspend fun closeAllActiveSessions(endTime: Long)
 }

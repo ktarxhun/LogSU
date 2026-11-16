@@ -65,6 +65,10 @@ object RootShellManager {
         }
     }
 
+    fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\\''") + "'"
+    }
+
     fun execute(cmd: String): List<String> {
         return try {
             Shell.cmd(cmd).exec().out
@@ -82,6 +86,7 @@ object RootShellManager {
         cachedTouchDevice?.let { return it }
         val out = execute("getevent -p")
         var currentDevice: String? = null
+        var fallbackCandidate: String? = null
 
         for (line in out) {
             if (line.startsWith("add device")) {
@@ -96,7 +101,17 @@ object RootShellManager {
                     return currentDevice
                 }
             }
+            if (fallbackCandidate == null && currentDevice != null &&
+                (line.contains("input_mt", ignoreCase = true) || line.contains("TOUCH", ignoreCase = true))
+            ) {
+                fallbackCandidate = currentDevice
+            }
         }
-        return "/dev/input/event1"
+        if (fallbackCandidate != null) {
+            cachedTouchDevice = fallbackCandidate
+            return fallbackCandidate
+        }
+        val hasEvent1 = executeSingle("if [ -e /dev/input/event1 ]; then echo 1; fi").trim() == "1"
+        return if (hasEvent1) "/dev/input/event1" else null
     }
 }

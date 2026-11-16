@@ -64,6 +64,8 @@
             android:excludeFromRecents="true"
             android:noHistory="true"
             android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
             android:taskAffinity=""
             android:theme="@style/Theme.LogSU.TransparentTrampoline" />
 
@@ -86,13 +88,21 @@
         <service
             android:name=".service.CallMonitorService"
             android:exported="false"
-            android:foregroundServiceType="microphone|specialUse" />
+            android:foregroundServiceType="microphone|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Arama ve ses kayit servisi" />
+        </service>
 
         <!-- Emanet Modu Arka Plan Koruma Servisi -->
         <service
             android:name=".service.GuestGuardService"
             android:exported="false"
-            android:foregroundServiceType="camera|microphone|specialUse" />
+            android:foregroundServiceType="camera|microphone|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Emanet modu koruma ve sistem izleme servisi" />
+        </service>
 
         <!-- WhatsApp Arama ve Uygulama İzleme Erişilebilirlik Servisi -->
         <service

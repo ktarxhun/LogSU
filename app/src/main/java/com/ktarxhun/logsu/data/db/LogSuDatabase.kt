@@ -45,6 +45,12 @@ abstract class LogSuDatabase : RoomDatabase() {
                     "logsu_database.db"
                 )
                 .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addCallback(object : RoomDatabase.Callback() {
+                    override fun onOpen(db: SupportSQLiteDatabase) {
+                        super.onOpen(db)
+                        db.execSQL("PRAGMA foreign_keys = ON")
+                    }
+                })
                 .build()
                 INSTANCE = instance
                 instance

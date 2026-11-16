@@ -23,9 +23,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
@@ -54,11 +57,7 @@ class CallMonitorService : Service() {
             }
             var started = false
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
+                context.startForegroundService(intent)
                 started = true
             } catch (e: Exception) {
                 Log.w(TAG, "Standart startForegroundService basarisiz (${e.javaClass.simpleName}: ${e.message}), Root Shell deneniyor")
@@ -89,15 +88,14 @@ class CallMonitorService : Service() {
         private fun startViaRoot(context: Context, action: String, phoneNumber: String, callType: CallType) {
             val pkg = context.packageName
             val cls = CallMonitorService::class.java.name
-            val escapedNumber = phoneNumber.replace("\"", "\\\"").replace("'", "\\'")
-            val cmd = "am start-foreground-service -a $action --es $EXTRA_PHONE_NUMBER \"$escapedNumber\" --es $EXTRA_CALL_TYPE \"${callType.name}\" $pkg/$cls"
+            val cmd = "am start-foreground-service -a ${RootShellManager.shellQuote(action)} --es ${RootShellManager.shellQuote(EXTRA_PHONE_NUMBER)} ${RootShellManager.shellQuote(phoneNumber)} --es ${RootShellManager.shellQuote(EXTRA_CALL_TYPE)} ${RootShellManager.shellQuote(callType.name)} ${RootShellManager.shellQuote("$pkg/$cls")}"
             RootShellManager.execute(cmd)
         }
 
         private fun stopViaRoot(context: Context) {
             val pkg = context.packageName
             val cls = CallMonitorService::class.java.name
-            val cmd = "am start-service -a $ACTION_STOP_CALL $pkg/$cls"
+            val cmd = "am start-service -a ${RootShellManager.shellQuote(ACTION_STOP_CALL)} ${RootShellManager.shellQuote("$pkg/$cls")}"
             RootShellManager.execute(cmd)
         }
 
@@ -114,11 +112,7 @@ class CallMonitorService : Service() {
             val intent = Intent(context, CallMonitorService::class.java).apply {
                 action = ACTION_START_AMBIENT
             }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stopAmbientRecording(context: Context) {
@@ -131,7 +125,9 @@ class CallMonitorService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionMutex = Mutex()
     private val audioController = AudioCaptureController()
+    @Volatile
     private var currentPhoneNumber: String = "Bilinmeyen"
     private var currentCallType: CallType = CallType.INCOMING_GSM
     private var startTimeMs: Long = 0
@@ -163,7 +159,14 @@ class CallMonitorService : Service() {
     }
 
     private fun startRecordingSession(phoneNumber: String, callType: CallType) {
-        if (isRecording) return
+        if (isRecording) {
+            if (phoneNumber.isNotBlank() && phoneNumber != "Bilinmeyen" &&
+                (currentPhoneNumber == "Bilinmeyen" || currentPhoneNumber.isBlank())
+            ) {
+                currentPhoneNumber = phoneNumber
+            }
+            return
+        }
         isRecording = true
         startTimeMs = System.currentTimeMillis()
         currentPhoneNumber = phoneNumber
@@ -221,17 +224,20 @@ class CallMonitorService : Service() {
         Log.i(TAG, "Ses kaydi oturumu baslatildi: $phoneNumber ($callType, dual=$isDualChannel)")
 
         serviceScope.launch {
-            val started = audioController.startRecording(targetFile, enableDualInternalMic = isDualChannel)
-            if (!started) {
-                Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
-                isRecording = false
-                if (callType == CallType.AMBIENT_RECORDING) {
-                    _isAmbientRecordingFlow.value = false
+            sessionMutex.withLock {
+                if (!isRecording) return@withLock
+                val started = audioController.startRecording(targetFile, enableDualInternalMic = isDualChannel)
+                if (!started) {
+                    Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
+                    isRecording = false
+                    if (callType == CallType.AMBIENT_RECORDING) {
+                        _isAmbientRecordingFlow.value = false
+                    }
+                    targetFile.delete()
+                    audioFile = null
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
                 }
-                targetFile.delete()
-                audioFile = null
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
             }
         }
     }
@@ -243,13 +249,15 @@ class CallMonitorService : Service() {
 
         val endTimeMs = System.currentTimeMillis()
         val capturedFile = audioFile
-        val capturedNumber = currentPhoneNumber
         val capturedType = currentCallType
         val capturedStart = startTimeMs
 
         serviceScope.launch {
-            audioController.stopRecordingSuspend()
+            sessionMutex.withLock {
+                audioController.stopRecordingSuspend()
+            }
 
+            val capturedNumber = currentPhoneNumber
             val wavDurationSec = computeWavDurationSeconds(capturedFile)
             val wallDurationSec = ((endTimeMs - capturedStart) / 1000L).coerceAtLeast(0L)
             val durationSec = if (wavDurationSec > 0) wavDurationSec else wallDurationSec
@@ -272,13 +280,14 @@ class CallMonitorService : Service() {
                 finalContactName = "Yüz Yüze / Ortam Kaydı"
             } else {
                 if (finalNumber == "Bilinmeyen" || finalNumber.isBlank()) {
-                    val logInfo = resolveCallInfoFromLog()
+                    val logInfo = resolveCallInfoFromLog(capturedStart) ?: run {
+                        delay(500)
+                        resolveCallInfoFromLog(capturedStart)
+                    }
                     if (logInfo != null) {
                         finalNumber = logInfo.number
                         finalContactName = logInfo.cachedName
-                        if (logInfo.callType != null) {
-                            finalCallType = logInfo.callType
-                        }
+                        logInfo.callType?.let { finalCallType = it }
                     }
                 }
                 if (finalContactName.isNullOrBlank()) {
@@ -305,10 +314,9 @@ class CallMonitorService : Service() {
             val recordId = LogSuApp.instance.repository.insertCallRecord(record)
             Log.i(TAG, "Ses kaydi veritabanina eklendi, ID: $recordId (${durationSec}s)")
 
-            OfflineSpeechTranscriber.transcribeCall(capturedFile) { text ->
-                serviceScope.launch {
-                    LogSuApp.instance.repository.updateTranscript(recordId, text)
-                }
+            val transcriptText = OfflineSpeechTranscriber.transcribeCallSuspend(capturedFile)
+            if (transcriptText.isNotBlank()) {
+                LogSuApp.instance.repository.updateTranscript(recordId, transcriptText)
             }
 
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -344,18 +352,19 @@ class CallMonitorService : Service() {
 
     private data class CallLogInfo(val number: String, val cachedName: String?, val callType: CallType?)
 
-    private fun resolveCallInfoFromLog(): CallLogInfo? {
+    private fun resolveCallInfoFromLog(afterTimestampMs: Long): CallLogInfo? {
         return try {
             val cursor = contentResolver.query(
                 CallLog.Calls.CONTENT_URI,
                 arrayOf(
                     CallLog.Calls.NUMBER,
                     CallLog.Calls.CACHED_NAME,
-                    CallLog.Calls.TYPE
+                    CallLog.Calls.TYPE,
+                    CallLog.Calls.DATE
                 ),
-                null,
-                null,
-                "${CallLog.Calls.DATE} DESC LIMIT 1"
+                "${CallLog.Calls.DATE} >= ?",
+                arrayOf((afterTimestampMs - 60_000L).toString()),
+                "${CallLog.Calls.DATE} DESC"
             )
             cursor?.use {
                 if (it.moveToFirst()) {

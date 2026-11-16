@@ -112,7 +112,7 @@ object GalleryExporter {
 
         try {
             // Root sahipliğindeki dosyayı okunabilir geçici alana al
-            RootShellManager.execute("cp -f '${videoFile.absolutePath}' '${readableVideo.absolutePath}' && chmod 666 '${readableVideo.absolutePath}'")
+            RootShellManager.execute("cp -f ${RootShellManager.shellQuote(videoFile.absolutePath)} ${RootShellManager.shellQuote(readableVideo.absolutePath)} && chmod 666 ${RootShellManager.shellQuote(readableVideo.absolutePath)}")
             val sourceVideo = if (readableVideo.exists() && readableVideo.length() > 1024L) readableVideo else videoFile
 
             var muxSuccess = false
@@ -289,7 +289,7 @@ object GalleryExporter {
             fis.skip(wavInfo.dataOffset)
 
             val pcmBuffer = ByteArray(4096)
-            val bytesPerSecond = wavInfo.sampleRate.toDouble() * wavInfo.channels * 2.0
+            val bytesPerSecond = wavInfo.sampleRate.toDouble() * wavInfo.channels * (wavInfo.bitsPerSample / 8.0).coerceAtLeast(1.0)
             var pcmEos = false
             var audioEos = false
             var totalPcmBytes = 0L
@@ -385,9 +385,11 @@ object GalleryExporter {
             return false
         } finally {
             try { fis?.close() } catch (_: Exception) {}
-            try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}
+            try { audioCodec?.stop() } catch (_: Exception) {}
+            try { audioCodec?.release() } catch (_: Exception) {}
             try { extractor?.release() } catch (_: Exception) {}
-            try { muxer?.stop(); muxer?.release() } catch (_: Exception) {}
+            try { muxer?.stop() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Exception) {}
         }
     }
 
@@ -458,7 +460,7 @@ object GalleryExporter {
             fis.skip(wavInfo.dataOffset)
 
             val pcmBuffer = ByteArray(4096)
-            val bytesPerSecond = wavInfo.sampleRate.toDouble() * wavInfo.channels * 2.0
+            val bytesPerSecond = wavInfo.sampleRate.toDouble() * wavInfo.channels * (wavInfo.bitsPerSample / 8.0).coerceAtLeast(1.0)
             var totalPcmBytes = 0L
             var pcmEos = false
             var audioEos = false
@@ -596,9 +598,12 @@ object GalleryExporter {
             return false
         } finally {
             try { fis?.close() } catch (_: Exception) {}
-            try { videoCodec?.stop(); videoCodec?.release() } catch (_: Exception) {}
-            try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}
-            try { muxer?.stop(); muxer?.release() } catch (_: Exception) {}
+            try { videoCodec?.stop() } catch (_: Exception) {}
+            try { videoCodec?.release() } catch (_: Exception) {}
+            try { audioCodec?.stop() } catch (_: Exception) {}
+            try { audioCodec?.release() } catch (_: Exception) {}
+            try { muxer?.stop() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Exception) {}
         }
     }
 

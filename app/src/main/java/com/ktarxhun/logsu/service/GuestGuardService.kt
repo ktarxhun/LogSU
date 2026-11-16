@@ -91,11 +91,7 @@ class GuestGuardService : Service() {
             val intent = Intent(context, GuestGuardService::class.java).apply {
                 action = ACTION_START_GUARD
             }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stopService(context: Context, triggerTileRefresh: Boolean = true) {
@@ -298,33 +294,46 @@ class GuestGuardService : Service() {
         val copies = clipboardCopyCount
 
         stopSessionJob = serviceScope.launch {
-            coroutineScope {
-                launch { audioController.stopRecordingSuspend() }
-                launch { screenController.stopRecording() }
-            }
-
-            if (closingSessionId > 0) {
-                val session = LogSuApp.instance.repository.getGuestSessionById(closingSessionId)
-                if (session != null) {
-                    val updated = session.copy(
-                        endTime = System.currentTimeMillis(),
-                        totalAppSwitches = switches,
-                        totalClipboardCopies = copies,
-                        videoFilePath = vFile?.takeIf { it.exists() && it.length() > 1024 }?.absolutePath,
-                        touchFilePath = tFile?.takeIf { it.exists() && it.length() > 0 }?.absolutePath,
-                        audioFilePath = aFile?.takeIf { it.exists() && it.length() > 44 }?.absolutePath,
-                        isActive = false
-                    )
-                    LogSuApp.instance.repository.updateGuestSession(updated)
+            try {
+                try {
+                    coroutineScope {
+                        launch { audioController.stopRecordingSuspend() }
+                        launch { screenController.stopRecording() }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Kayit kontrolculeri durdurulurken hata olustu", e)
                 }
-                LogSuApp.instance.repository.closeActiveGuestSession(closingSessionId)
-                Log.i(TAG, "Emanet Modu kapatildi, oturum kaydedildi: ID $closingSessionId")
-            }
 
-            if (!_isSessionActiveFlow.value) {
-                activeSessionId = 0
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (closingSessionId > 0) {
+                    try {
+                        val session = LogSuApp.instance.repository.getGuestSessionById(closingSessionId)
+                        if (session != null) {
+                            val updated = session.copy(
+                                endTime = System.currentTimeMillis(),
+                                totalAppSwitches = switches,
+                                totalClipboardCopies = copies,
+                                videoFilePath = vFile?.takeIf { it.exists() && it.length() > 1024 }?.absolutePath,
+                                touchFilePath = tFile?.takeIf { it.exists() && it.length() > 0 }?.absolutePath,
+                                audioFilePath = aFile?.takeIf { it.exists() && it.length() > 44 }?.absolutePath,
+                                isActive = false
+                            )
+                            LogSuApp.instance.repository.updateGuestSession(updated)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Oturum guncelleme hatasi: ID $closingSessionId", e)
+                    } finally {
+                        runCatching {
+                            LogSuApp.instance.repository.closeActiveGuestSession(closingSessionId)
+                        }
+                    }
+                    Log.i(TAG, "Emanet Modu kapatildi, oturum kaydedildi: ID $closingSessionId")
+                }
+            } finally {
+                if (!_isSessionActiveFlow.value) {
+                    activeSessionId = 0
+                    runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                    stopSelf()
+                }
             }
         }
     }
