@@ -23,12 +23,7 @@ object RootShellManager {
     }
 
     fun isRootAvailable(): Boolean {
-        val isMainThread = runCatching {
-            val main = Looper.getMainLooper()
-            main != null && Looper.myLooper() == main
-        }.getOrDefault(false)
-
-        if (isMainThread) {
+        if (isMainThread()) {
             Log.w(TAG, "isRootAvailable ana thread uzerinde cagrildi, onbellek donuluyor")
             return isRootCached()
         }
@@ -71,12 +66,47 @@ object RootShellManager {
 
     fun execute(cmd: String): List<String> {
         return try {
-            Shell.cmd(cmd).exec().out
+            val shell = acquireRootShell()
+            if (shell == null) {
+                // Onceki davranis non-root kabukta komutu sessizce calistiriyordu; bu yaniltici sonuc uretiyordu.
+                Log.w(TAG, "Root kabugu yok, komut calistirilmadi: ${preview(cmd)}")
+                return emptyList()
+            }
+            val result = Shell.cmd(cmd).exec()
+            if (!result.isSuccess) {
+                Log.e(
+                    TAG,
+                    "Komut basarisiz (exit=${result.code}): ${preview(cmd)} | " +
+                        "out=${result.out.take(2)} err=${result.err.take(2)}"
+                )
+            }
+            result.out
         } catch (e: Exception) {
-            Log.e(TAG, "Komut calistirma hatasi: $cmd", e)
+            Log.e(TAG, "Komut calistirma hatasi: ${preview(cmd)}", e)
             emptyList()
         }
     }
+
+    private fun acquireRootShell(): Shell? {
+        val cached = runCatching { Shell.getCachedShell() }.getOrNull()
+        if (cached != null) {
+            return if (cached.isRoot) cached else null
+        }
+        // Onbellekte kabuk yoksa root kabugu istenir; ana thread uzerinde bloklayici istek yapilmaz.
+        if (isMainThread()) {
+            Log.w(TAG, "Root kabugu onbellekte yok, ana thread uzerinde root istenmiyor")
+            return null
+        }
+        return runCatching { Shell.getShell() }.getOrNull()?.takeIf { it.isRoot }
+    }
+
+    private fun isMainThread(): Boolean = runCatching {
+        val main = Looper.getMainLooper()
+        main != null && Looper.myLooper() == main
+    }.getOrDefault(false)
+
+    private fun preview(cmd: String): String =
+        if (cmd.length > 160) cmd.take(160) + "..." else cmd
 
     fun executeSingle(cmd: String): String {
         return execute(cmd).joinToString("\n")

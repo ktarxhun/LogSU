@@ -8,6 +8,7 @@ import android.content.Context
 import android.media.AudioManager
 import android.os.Build
 import android.telephony.TelephonyManager
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
@@ -16,6 +17,7 @@ import com.ktarxhun.logsu.data.db.LogSuDatabase
 import com.ktarxhun.logsu.data.model.CallType
 import com.ktarxhun.logsu.data.repository.RecordRepository
 import com.ktarxhun.logsu.service.CallMonitorService
+import com.ktarxhun.logsu.service.CallReceiver
 import com.ktarxhun.logsu.service.GuestGuardService
 import com.ktarxhun.logsu.service.RetentionWorker
 import com.ktarxhun.logsu.ui.auth.AppSessionLock
@@ -32,6 +34,9 @@ import java.util.concurrent.TimeUnit
 class LogSuApp : Application() {
 
     companion object {
+        private const val TAG = "LogSuApp"
+        private const val VOIP_START_DELAY_MS = 600L
+        private const val VOIP_STOP_DEBOUNCE_MS = 1500L
         const val CHANNEL_CALL_MONITOR = "logsu_call_monitor"
         const val CHANNEL_GUEST_GUARD = "logsu_guest_guard"
         lateinit var instance: LogSuApp
@@ -40,6 +45,7 @@ class LogSuApp : Application() {
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var voipStartJob: Job? = null
+    private var voipStopJob: Job? = null
     @Volatile
     private var isVoipCallActive = false
     val database by lazy { LogSuDatabase.getDatabase(this) }
@@ -61,6 +67,9 @@ class LogSuApp : Application() {
         createNotificationChannels()
         scheduleRetentionWorker()
         GuestGuardService.initPrefs(this)
+        appScope.launch {
+            runCatching { CallReceiver.resetStateIfStale(this@LogSuApp) }
+        }
         if (!GuestGuardService.isSessionActive) {
             appScope.launch {
                 runCatching { repository.closeOrphanedGuestSessions() }
@@ -92,17 +101,19 @@ class LogSuApp : Application() {
 
     private fun handleAudioModeChanged(mode: Int, audioManager: AudioManager) {
         if (mode == AudioManager.MODE_IN_COMMUNICATION) {
+            // Mod geri geldiyse bekleyen durdurma islemi iptal edilir.
+            voipStopJob?.cancel()
+            voipStopJob = null
             if (isVoipCallActive) return
             voipStartJob?.cancel()
             voipStartJob = appScope.launch {
-                delay(600L)
+                delay(VOIP_START_DELAY_MS)
                 if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) return@launch
-                val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-                val isGsmIdle = runCatching {
-                    @Suppress("DEPRECATION")
-                    tm?.callState == TelephonyManager.CALL_STATE_IDLE
-                }.getOrDefault(true)
-                if (isGsmIdle && !isVoipCallActive) {
+                if (isGsmCallBusy(audioManager)) {
+                    Log.d(TAG, "GSM aramasi suruyor, VoIP kaydi baslatilmiyor")
+                    return@launch
+                }
+                if (!isVoipCallActive) {
                     isVoipCallActive = true
                     CallMonitorService.startCall(this@LogSuApp, "WhatsApp Görüşmesi", CallType.WHATSAPP_CALL)
                 }
@@ -110,11 +121,36 @@ class LogSuApp : Application() {
         } else {
             voipStartJob?.cancel()
             voipStartJob = null
-            if (isVoipCallActive) {
-                isVoipCallActive = false
-                CallMonitorService.stopCall(this@LogSuApp)
+            if (!isVoipCallActive) return
+            // Cikista aninda durdurma yok: hoparlor/ahize/Bluetooth gecisleri ses modunu kisa sure degistirebilir.
+            voipStopJob?.cancel()
+            voipStopJob = appScope.launch {
+                delay(VOIP_STOP_DEBOUNCE_MS)
+                if (audioManager.mode == AudioManager.MODE_IN_COMMUNICATION) {
+                    Log.d(TAG, "Ses modu geri geldi, VoIP kaydi surduruluyor")
+                    return@launch
+                }
+                if (isGsmCallBusy(audioManager)) {
+                    // GSM aramasinin kaydini VoIP izleyicisi durdurmamali; kapatmayi CallReceiver yonetir.
+                    // Bayrak korunur, boylece VoIP gorusmesi kapandiginda kayit kapanabilir.
+                    Log.i(TAG, "GSM aramasi suruyor, VoIP izleyicisi kaydi durdurmuyor")
+                    return@launch
+                }
+                if (isVoipCallActive) {
+                    isVoipCallActive = false
+                    CallMonitorService.stopCall(this@LogSuApp)
+                }
             }
         }
+    }
+
+    private fun isGsmCallBusy(audioManager: AudioManager): Boolean {
+        if (audioManager.mode == AudioManager.MODE_IN_CALL) return true
+        val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return false
+        return runCatching {
+            @Suppress("DEPRECATION")
+            tm.callState != TelephonyManager.CALL_STATE_IDLE
+        }.getOrDefault(false)
     }
 
     private fun createNotificationChannels() {

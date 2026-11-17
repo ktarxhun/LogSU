@@ -29,6 +29,7 @@ import com.ktarxhun.logsu.root.TouchCaptureController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
@@ -37,6 +38,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -129,6 +133,9 @@ class GuestGuardService : Service() {
     private val screenController = ScreenRecordController()
     private val touchController = TouchCaptureController()
     private val audioController = AudioCaptureController()
+    // Baslatma ve durdurma akislarini serilestirir. Oturum yasam dongusu yarislarini onler.
+    private val sessionMutex = Mutex()
+    private var startSessionJob: Job? = null
     private var stopSessionJob: Job? = null
     private var foregroundWatchJob: Job? = null
 
@@ -153,6 +160,18 @@ class GuestGuardService : Service() {
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private val isCameraBusy = AtomicBoolean(false)
+    // Devam eden yakalamanin kamera kaynaklarini kapatan eylem. Servis kapanirken
+    // beklemedeki kamera callback'lerini kaybetmeden kaynaklari serbest birakmayi saglar.
+    private val cameraReleaseAction = AtomicReference<(() -> Unit)?>(null)
+
+    private val gracePeriodRunnable = object : Runnable {
+        override fun run() {
+            if (gracePeriodActive) {
+                gracePeriodActive = false
+                Log.i(TAG, "Grace period (20sn) sona erdi.")
+            }
+        }
+    }
 
     private val periodicPhotoRunnable = object : Runnable {
         override fun run() {
@@ -202,8 +221,28 @@ class GuestGuardService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Baslatma hata yollarinda oturum durumunu geri alir. Aksi halde on plan servis,
+     * bildirim ve tile acik kalir, Dashboard perdeyi kapatamaz.
+     */
+    private fun abortSessionStart(reason: String) {
+        Log.e(TAG, "Emanet oturumu baslatilamadi: $reason")
+        _isSessionActiveFlow.value = false
+        getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
+        SystemProtectionTileService.requestRefresh(this)
+        cancelPhotoTasks()
+        releaseActiveCamera()
+        unregisterScreenReceiver()
+        removeClipboardListener()
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelf()
+    }
+
     private fun startGuestSession() {
-        _isSessionActiveFlow.value = true
+        if (!_isSessionActiveFlow.value) {
+            Log.w(TAG, "Emanet oturumu baslatma istegi pasif durumda geldi, yoksayildi")
+            return
+        }
         gracePeriodActive = true
         appSwitchCount = 0
         clipboardCopyCount = 0
@@ -240,10 +279,7 @@ class GuestGuardService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "startForeground basarisiz oldu", e)
-            _isSessionActiveFlow.value = false
-            getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
-            SystemProtectionTileService.requestRefresh(this)
-            stopSelf()
+            abortSessionStart("On plan servis baslatilamadi")
             return
         }
 
@@ -252,43 +288,71 @@ class GuestGuardService : Service() {
         registerScreenReceiver()
         setupClipboardListener()
 
-        cameraHandler?.postDelayed({
-            if (gracePeriodActive) {
-                gracePeriodActive = false
-                Log.i(TAG, "Grace period (20sn) sona erdi.")
-            }
-        }, 20000)
-        cameraHandler?.postDelayed(periodicPhotoRunnable, PERIODIC_PHOTO_INTERVAL_MS)
+        schedulePhotoTasks()
 
-        serviceScope.launch {
-            stopSessionJob?.join()
-            val sessionId = LogSuApp.instance.repository.startGuestSession()
-            activeSessionId = sessionId
+        startSessionJob = serviceScope.launch {
+            // Baslatma ve durdurma ayni kilitle serilestirilir; boylece yarim kalan
+            // baslatma mikrofon, ekran kaydi veya dokunma yakalamayi artik birakmaz.
+            sessionMutex.withLock {
+                if (!_isSessionActiveFlow.value) {
+                    Log.w(TAG, "Baslatma sirasinda oturum kapatildi, kaynak acilmadi")
+                    return@withLock
+                }
+                if (activeSessionId > 0) {
+                    Log.w(TAG, "Emanet oturumu zaten acik (ID=$activeSessionId), yinelenen baslatma yoksayildi")
+                    return@withLock
+                }
+                val repository = LogSuApp.instance?.repository
+                if (repository == null) {
+                    abortSessionStart("Depo erisilemiyor")
+                    return@withLock
+                }
 
-            val guestDir = getGuestRecordingsDir()
-            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date(sessionStartTime))
-            val vFile = File(guestDir, "guest_${sessionId}_${timeStamp}.mp4")
-            val tFile = File(guestDir, "guest_${sessionId}_${timeStamp}.touch")
-            val aFile = File(guestDir, "guest_${sessionId}_${timeStamp}.wav")
+                val sessionId = try {
+                    repository.startGuestSession()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Emanet oturumu kaydedilemedi", e)
+                    abortSessionStart("Oturum kaydi olusturulamadi")
+                    return@withLock
+                }
+                activeSessionId = sessionId
 
-            videoFile = vFile
-            touchFile = tFile
-            audioFile = aFile
+                val guestDir = getGuestRecordingsDir()
+                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date(sessionStartTime))
+                val vFile = File(guestDir, "guest_${sessionId}_${timeStamp}.mp4")
+                val tFile = File(guestDir, "guest_${sessionId}_${timeStamp}.touch")
+                val aFile = File(guestDir, "guest_${sessionId}_${timeStamp}.wav")
 
-            val isInteractive = (getSystemService(PowerManager::class.java)?.isInteractive) != false
-            screenController.setScreenInteractive(isInteractive)
+                videoFile = vFile
+                touchFile = tFile
+                audioFile = aFile
 
-            touchController.startCapture(tFile, sessionStartTime)
-            if (RootShellManager.isRootAvailable()) {
-                RootShellManager.execute("appops set ${RootShellManager.shellQuote(packageName)} GET_USAGE_STATS allow 2>/dev/null")
-            }
-            foregroundWatchJob?.cancel()
-            foregroundWatchJob = serviceScope.launch {
-                watchForegroundApps()
-            }
-            coroutineScope {
-                launch { screenController.startRecording(this@GuestGuardService, vFile) }
-                launch { audioController.startRecording(aFile, enableDualInternalMic = true) }
+                val isInteractive = (getSystemService(PowerManager::class.java)?.isInteractive) != false
+                screenController.setScreenInteractive(isInteractive)
+
+                touchController.startCapture(tFile, sessionStartTime)
+                if (RootShellManager.isRootAvailable()) {
+                    RootShellManager.execute("appops set ${RootShellManager.shellQuote(packageName)} GET_USAGE_STATS allow 2>/dev/null")
+                }
+                foregroundWatchJob?.cancel()
+                foregroundWatchJob = serviceScope.launch {
+                    watchForegroundApps()
+                }
+                coroutineScope {
+                    launch {
+                        runCatching { screenController.startRecording(this@GuestGuardService, vFile) }
+                            .onFailure { Log.e(TAG, "Ekran kaydi baslatilamadi", it) }
+                    }
+                    launch {
+                        runCatching { audioController.startRecording(aFile, enableDualInternalMic = true) }
+                            .onFailure { Log.e(TAG, "Ses kaydi baslatilamadi", it) }
+                    }
+                }
+
+                if (!_isSessionActiveFlow.value) {
+                    Log.w(TAG, "Baslatma sirasinda durdurma istendi, oturum geri aliniyor")
+                    closeSessionResourcesAndRecord()
+                }
             }
         }
     }
@@ -300,10 +364,48 @@ class GuestGuardService : Service() {
 
         foregroundWatchJob?.cancel()
         foregroundWatchJob = null
-        cameraHandler?.removeCallbacksAndMessages(null)
+        cancelPhotoTasks()
+        releaseActiveCamera()
         unregisterScreenReceiver()
         removeClipboardListener()
         touchController.stopCapture()
+
+        stopSessionJob = serviceScope.launch {
+            try {
+                // Durdurma, devam eden baslatma isinin bitmesini bekler ve kaynaklari kapatir.
+                withContext(NonCancellable) {
+                    sessionMutex.withLock { closeSessionResourcesAndRecord() }
+                }
+            } finally {
+                if (!_isSessionActiveFlow.value) {
+                    runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+    /**
+     * Kayit kontrolculerini durdurur, dosya yollarini ve oturum satirini tamamlar.
+     * Idempotenttir; baslatma geri alinirken ve servis yok edilirken de cagrilir.
+     */
+    private suspend fun closeSessionResourcesAndRecord() {
+        runCatching { touchController.stopCapture() }
+            .onFailure { Log.e(TAG, "Dokunma yakalama durdurulamadi", it) }
+        try {
+            coroutineScope {
+                launch {
+                    runCatching { audioController.stopRecordingSuspend() }
+                        .onFailure { Log.e(TAG, "Ses kaydi durdurulamadi", it) }
+                }
+                launch {
+                    runCatching { screenController.stopRecording() }
+                        .onFailure { Log.e(TAG, "Ekran kaydi durdurulamadi", it) }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Kayit kontrolculeri durdurulurken hata olustu", e)
+        }
 
         val closingSessionId = activeSessionId
         val vFile = videoFile
@@ -315,20 +417,12 @@ class GuestGuardService : Service() {
         val switches = appSwitchCount
         val copies = clipboardCopyCount
 
-        stopSessionJob = serviceScope.launch {
-            try {
-                try {
-                    coroutineScope {
-                        launch { audioController.stopRecordingSuspend() }
-                        launch { screenController.stopRecording() }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Kayit kontrolculeri durdurulurken hata olustu", e)
-                }
-
-                if (closingSessionId > 0) {
+        try {
+            if (closingSessionId > 0) {
+                val repository = LogSuApp.instance?.repository
+                if (repository != null) {
                     try {
-                        val session = LogSuApp.instance.repository.getGuestSessionById(closingSessionId)
+                        val session = repository.getGuestSessionById(closingSessionId)
                         if (session != null) {
                             val updated = session.copy(
                                 endTime = System.currentTimeMillis(),
@@ -339,25 +433,37 @@ class GuestGuardService : Service() {
                                 audioFilePath = aFile?.takeIf { it.exists() && it.length() > 44 }?.absolutePath,
                                 isActive = false
                             )
-                            LogSuApp.instance.repository.updateGuestSession(updated)
+                            repository.updateGuestSession(updated)
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Oturum guncelleme hatasi: ID $closingSessionId", e)
                     } finally {
-                        runCatching {
-                            LogSuApp.instance.repository.closeActiveGuestSession(closingSessionId)
-                        }
+                        runCatching { repository.closeActiveGuestSession(closingSessionId) }
                     }
                     Log.i(TAG, "Emanet Modu kapatildi, oturum kaydedildi: ID $closingSessionId")
                 }
-            } finally {
-                if (!_isSessionActiveFlow.value) {
-                    activeSessionId = 0
-                    runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                    stopSelf()
-                }
             }
+        } finally {
+            activeSessionId = 0
         }
+    }
+
+    private fun schedulePhotoTasks() {
+        val handler = cameraHandler ?: return
+        handler.removeCallbacks(gracePeriodRunnable)
+        handler.removeCallbacks(periodicPhotoRunnable)
+        handler.postDelayed(gracePeriodRunnable, 20000L)
+        handler.postDelayed(periodicPhotoRunnable, PERIODIC_PHOTO_INTERVAL_MS)
+    }
+
+    private fun cancelPhotoTasks() {
+        cameraHandler?.removeCallbacks(gracePeriodRunnable)
+        cameraHandler?.removeCallbacks(periodicPhotoRunnable)
+    }
+
+    private fun releaseActiveCamera() {
+        val action = cameraReleaseAction.getAndSet(null) ?: return
+        runCatching { action.invoke() }
     }
 
     private fun getGuestRecordingsDir(): File {
@@ -418,6 +524,7 @@ class GuestGuardService : Service() {
     }
 
     private fun setupClipboardListener() {
+        removeClipboardListener()
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
             if (!_isSessionActiveFlow.value || activeSessionId <= 0) return@OnPrimaryClipChangedListener
@@ -503,10 +610,6 @@ class GuestGuardService : Service() {
             return
         }
 
-        val photosDir = File(filesDir, "guest_photos")
-        if (!photosDir.exists()) photosDir.mkdirs()
-
-        val photoFile = File(photosDir, "guest_${activeSessionId}_${System.currentTimeMillis()}.jpg")
         val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? CameraManager
         if (cameraManager == null) {
             isCameraBusy.set(false)
@@ -514,40 +617,59 @@ class GuestGuardService : Service() {
             return
         }
 
+        val photosDir = File(filesDir, "guest_photos")
+        if (!photosDir.exists()) photosDir.mkdirs()
+
+        val photoFile = File(photosDir, "guest_${activeSessionId}_${System.currentTimeMillis()}.jpg")
+
+        val callbackCalled = AtomicBoolean(false)
+        val activeCamera = AtomicReference<CameraDevice?>(null)
+        val activeSession = AtomicReference<CameraCaptureSession?>(null)
+        var imageReader: ImageReader? = null
+
+        // Tum kaynaklari tek yerden kapatir; yarim kalan yakalamada kamera acik kalmaz.
+        fun releaseCameraResources() {
+            cameraReleaseAction.set(null)
+            runCatching { activeSession.getAndSet(null)?.close() }
+            runCatching { activeCamera.getAndSet(null)?.close() }
+            runCatching { imageReader?.close() }
+            imageReader = null
+        }
+
+        // Tum cikis yollari buradan gecer; onFinished en fazla bir kez cagrilir.
+        fun finishWith(path: String?) {
+            if (callbackCalled.compareAndSet(false, true)) {
+                releaseCameraResources()
+                isCameraBusy.set(false)
+                onFinished(path)
+            }
+        }
+
+        cameraReleaseAction.set { finishWith(null) }
+
         try {
             val frontCameraId = cameraManager.cameraIdList.firstOrNull { id ->
                 val chars = cameraManager.getCameraCharacteristics(id)
                 chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
             }
             if (frontCameraId == null) {
-                isCameraBusy.set(false)
-                onFinished(null)
+                finishWith(null)
                 return
             }
 
-            val imageReader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
-            val callbackCalled = AtomicBoolean(false)
-            val activeCamera = AtomicReference<CameraDevice?>(null)
+            val reader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
+            imageReader = reader
 
-            fun finishWith(camera: CameraDevice?, path: String?) {
-                if (callbackCalled.compareAndSet(false, true)) {
-                    try { (camera ?: activeCamera.get())?.close() } catch (_: Exception) {}
-                    try { imageReader.close() } catch (_: Exception) {}
-                    isCameraBusy.set(false)
-                    onFinished(path)
-                }
-            }
-
-            // Kamera cevap vermezse kaynağın kilitlenmemesi için güvenlik zaman aşımı
+            // Kamera cevap vermezse kaynagin kilitlenmemesi icin guvenlik zaman asimi
             handler.postDelayed({
                 if (!callbackCalled.get()) {
                     Log.w(TAG, "On kamera zaman asimina ugradi")
-                    finishWith(activeCamera.get(), null)
+                    finishWith(null)
                 }
             }, 5000)
 
-            imageReader.setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
+            reader.setOnImageAvailableListener({ imageReaderRef ->
+                val image = imageReaderRef.acquireLatestImage()
                 var savedPath: String? = null
                 if (image != null) {
                     try {
@@ -562,55 +684,58 @@ class GuestGuardService : Service() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Fotograf dosyaya yazilamadi", e)
                     } finally {
-                        image.close()
+                        runCatching { image.close() }
                     }
                 }
-                finishWith(activeCamera.get(), savedPath)
+                finishWith(savedPath)
             }, handler)
 
             cameraManager.openCamera(frontCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (callbackCalled.get()) {
-                        try { camera.close() } catch (_: Exception) {}
+                        runCatching { camera.close() }
                         return
                     }
                     activeCamera.set(camera)
                     try {
                         val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                            addTarget(imageReader.surface)
+                            addTarget(reader.surface)
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                         }
-                        camera.createCaptureSession(listOf(imageReader.surface), object : CameraCaptureSession.StateCallback() {
+                        camera.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
+                                if (callbackCalled.get()) {
+                                    runCatching { session.close() }
+                                    return
+                                }
+                                activeSession.set(session)
                                 try {
                                     session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                                         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
                                             super.onCaptureCompleted(s, r, result)
                                         }
                                     }, handler)
-                                } catch (_: Exception) {
-                                    finishWith(camera, null)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Kamera yakalama istegi basarisiz", e)
+                                    finishWith(null)
                                 }
                             }
                             override fun onConfigureFailed(session: CameraCaptureSession) {
-                                finishWith(camera, null)
+                                runCatching { session.close() }
+                                finishWith(null)
                             }
                         }, handler)
-                    } catch (_: Exception) {
-                        finishWith(camera, null)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Kamera oturumu kurulamadi", e)
+                        finishWith(null)
                     }
                 }
-                override fun onDisconnected(camera: CameraDevice) { finishWith(camera, null) }
-                override fun onError(camera: CameraDevice, error: Int) { finishWith(camera, null) }
+                override fun onDisconnected(camera: CameraDevice) { finishWith(null) }
+                override fun onError(camera: CameraDevice, error: Int) { finishWith(null) }
             }, handler)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Kamera izni eksik", e)
-            isCameraBusy.set(false)
-            onFinished(null)
         } catch (e: Exception) {
             Log.e(TAG, "Sessiz kamera yakalama hatasi", e)
-            isCameraBusy.set(false)
-            onFinished(null)
+            finishWith(null)
         }
     }
 
@@ -687,15 +812,24 @@ class GuestGuardService : Service() {
     override fun onDestroy() {
         foregroundWatchJob?.cancel()
         foregroundWatchJob = null
-        cameraHandler?.removeCallbacksAndMessages(null)
+        cancelPhotoTasks()
+        releaseActiveCamera()
         unregisterScreenReceiver()
         removeClipboardListener()
+        _isSessionActiveFlow.value = false
+        getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
+
+        startSessionJob?.cancel()
+        startSessionJob = null
+
+        // Servis yok edilirken kayit kontrolculeri kosulsuz kapatilir. Ana thread'de runBlocking
+        // kullanilmaz; kapatma mevcut stopGuestSession akisina (NonCancellable + IO) birakilir.
+        stopGuestSession()
+
         cameraThread?.quitSafely()
         cameraThread = null
         cameraHandler = null
-        serviceScope.cancel()
-        _isSessionActiveFlow.value = false
-        getSharedPreferences("logsu_prefs", Context.MODE_PRIVATE).edit().putBoolean("is_guard_active", false).apply()
+        stopSessionJob = null
         instance = null
         super.onDestroy()
     }

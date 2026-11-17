@@ -92,6 +92,7 @@ class TouchCaptureController {
                     Log.e(TAG, "Dokunma yakalama okuma hatasi", e)
                 }
             } finally {
+                isCapturing = false
                 process?.let { proc ->
                     runCatching { proc.destroy() }
                     if (proc.isAlive) runCatching { proc.destroyForcibly() }
@@ -101,8 +102,10 @@ class TouchCaptureController {
         }
     }
 
+    /**
+     * Yakalamayi durdurur. Idempotenttir; servis yok edilirken kosulsuz cagrilabilir.
+     */
     fun stopCapture() {
-        if (!isCapturing) return
         isCapturing = false
 
         try {
@@ -112,6 +115,7 @@ class TouchCaptureController {
             }
             process = null
             captureJob?.cancel()
+            captureJob = null
         } catch (e: Exception) {
             Log.e(TAG, "Dokunma yakalama durdurma hatasi", e)
         }

@@ -4,8 +4,11 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -18,6 +21,21 @@ class AudioCaptureController {
         const val SAMPLE_RATE = 44100
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val MAX_QUEUED_CHUNKS = 32
+        private const val INTERNAL_RETRY_DELAY_MS = 150L
+        private const val INTERNAL_STARTUP_TOLERANCE_MS = 4000L
+        /** Sag kanal icin mono kararinin verildigi pencere (saniye). */
+        private const val MONO_DECISION_WINDOW_SECONDS = 4
+        private const val MONO_DECISION_WINDOW_FRAMES = SAMPLE_RATE * MONO_DECISION_WINDOW_SECONDS
+        private const val ROOT_HELPER_CLASS = "com.ktarxhun.logsu.root.RootAudioRecorder"
+        private const val APP_PACKAGE = "com.ktarxhun.logsu"
+
+        /** app_process + ART sinif yukleme + AudioRecord acilisi icin taninan gercek pencere (~9 s). */
+        private const val ROOT_STARTUP_WAIT_MS = 100L
+        private const val ROOT_STARTUP_ATTEMPTS = 90
+        private const val ROOT_STARTUP_PROGRESS_LOG_MS = 2000L
+        private const val ROOT_STARTUP_ERROR_POLL_MS = 1000L
+        private const val ROOT_STOP_WAIT_ATTEMPTS = 60
+        private const val ROOT_STOP_TERM_WAIT_ATTEMPTS = 30
     }
 
     private var audioRecord: AudioRecord? = null
@@ -26,20 +44,42 @@ class AudioCaptureController {
     private var recordingJob: Job? = null
     private var internalReadJob: Job? = null
     private var outputFile: File? = null
+    @Volatile
     private var recordedChannels: Int = 2
+    @Volatile
+    private var rootRecording = false
+    @Volatile
+    private var rootRecorderPid: Int = -1
+    @Volatile
+    private var rootStopFile: File? = null
+    @Volatile
+    private var rootLogFile: File? = null
 
     @Volatile
     private var isRecording = false
+
+    /** Servis onDestroy gibi kapanis yollarinda kaydin hala acik olup olmadigini bildirir. */
+    fun isActiveRecording(): Boolean = isRecording
 
     /**
      * Ses kaydı başlatır.
      * enableDualInternalMic = true: Stereo WAV (Sol=Mikrofon, Sağ=Karşı Taraf / Dahili Ses)
      * enableDualInternalMic = false: Tek kanallı Mono WAV (Ortam Mikrofonu)
+     * useRootCapture = true: Cihaz rootluysa çağrı sesini root yardımcı süreciyle (VOICE_CALL) kaydeder.
+     * rootApkPath: Root yardımcı sürecinin CLASSPATH değeri için APK yolu.
      */
     @SuppressLint("MissingPermission")
-    fun startRecording(targetWavFile: File, enableDualInternalMic: Boolean = true): Boolean {
+    fun startRecording(
+        targetWavFile: File,
+        enableDualInternalMic: Boolean = true,
+        useRootCapture: Boolean = false,
+        rootApkPath: String? = null
+    ): Boolean {
         if (isRecording) return true
         outputFile = targetWavFile
+        rootRecording = false
+        rootRecorderPid = -1
+        rootStopFile = null
 
         val monoBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT)
             .coerceAtLeast(4096) * 2
@@ -74,6 +114,16 @@ class AudioCaptureController {
             }
             Log.i(TAG, "Mono ortam ses kaydi baslatildi: ${targetWavFile.name}")
             return true
+        }
+
+        // Cagri kaydi icin root yolu: uygulama UID'si yerine app_process (UID 0) altinda calisir.
+        if (useRootCapture && hasRootAccess()) {
+            val apkPath = rootApkPath ?: resolveApkPath()
+            if (!apkPath.isNullOrBlank() && startRootRecording(targetWavFile, apkPath)) {
+                Log.i(TAG, "Cagri sesi root yetkisiyle kaydediliyor: ${targetWavFile.name}")
+                return true
+            }
+            Log.w(TAG, "Root ses kaydedici baslatilamadi, normal AudioRecord yoluna donuluyor")
         }
 
         // 1. Ortam / Kullanıcı Mikrofonu (Sol Kanal)
@@ -130,7 +180,9 @@ class AudioCaptureController {
                 // Ikinci kaynak ayri is parcaciginda okunur; sessizlikte veya bloke oldugunda mikrofonu dondurmaz.
                 internalReadJob = CoroutineScope(Dispatchers.IO).launch {
                     val tempBuf = ShortArray(monoBufSize / 2)
-                    var zeroReadCount = 0
+                    val readStartedAt = SystemClock.elapsedRealtime()
+                    var emptyReadCount = 0
+                    var warnedNotProducing = false
                     while (isRecording) {
                         val read = try {
                             activeIntRec.read(tempBuf, 0, tempBuf.size)
@@ -138,7 +190,8 @@ class AudioCaptureController {
                             -1
                         }
                         if (read > 0) {
-                            zeroReadCount = 0
+                            emptyReadCount = 0
+                            warnedNotProducing = false
                             val copy = tempBuf.copyOf(read)
                             internalQueue.offer(copy)
                             if (queuedChunks.incrementAndGet() > MAX_QUEUED_CHUNKS) {
@@ -146,15 +199,18 @@ class AudioCaptureController {
                                     queuedChunks.decrementAndGet()
                                 }
                             }
-                        } else if (read < 0) {
-                            break
                         } else {
-                            // HAL (orn. arama yokken VOICE_CALL) surekli 0 donduruyorsa kaynak serbest birakilir.
-                            zeroReadCount++
-                            if (zeroReadCount >= 5) {
-                                Log.w(TAG, "Dahili ses kaynagi veri uretmiyor (read=0), serbest birakiliyor.")
-                                break
+                            // Cagri ses yolu henuz kurulmamis olabilir. Kaynagi kapatmak yerine kisa bekle ve tekrar dene.
+                            emptyReadCount++
+                            val elapsedMs = SystemClock.elapsedRealtime() - readStartedAt
+                            if (!warnedNotProducing && elapsedMs > INTERNAL_STARTUP_TOLERANCE_MS) {
+                                warnedNotProducing = true
+                                Log.w(
+                                    TAG,
+                                    "Dahili ses kaynagi henuz veri uretmiyor (read=$read, bosOkuma=$emptyReadCount), denenmeye devam ediliyor"
+                                )
                             }
+                            delay(INTERNAL_RETRY_DELAY_MS)
                         }
                     }
                     try { activeIntRec.stop() } catch (_: Exception) {}
@@ -247,6 +303,18 @@ class AudioCaptureController {
         if (!isRecording) return@withContext
         isRecording = false
 
+        if (rootRecording) {
+            stopRootRecording()
+            outputFile?.let { wavFile ->
+                if (wavFile.exists() && wavFile.length() > 44L) {
+                    recordedChannels = 1
+                    updateWavHeader(wavFile, 1)
+                }
+            }
+            Log.i(TAG, "Root cagri ses kaydi tamamlandi: ${outputFile?.absolutePath}")
+            return@withContext
+        }
+
         try {
             audioRecord?.stop()
         } catch (_: Exception) {}
@@ -278,6 +346,7 @@ class AudioCaptureController {
             internalAudioRecord = null
         }
 
+        // Mono karari yazici tarafinda ilk saniyelerde verilir; burada tum dosya kopyalanmaz.
         outputFile?.let { updateWavHeader(it, recordedChannels) }
         Log.i(TAG, "Ses kaydi tamamlandi: ${outputFile?.absolutePath}")
     }
@@ -286,6 +355,225 @@ class AudioCaptureController {
         runBlocking(Dispatchers.IO) {
             stopRecordingSuspend()
         }
+    }
+
+    private fun hasRootAccess(): Boolean {
+        return try {
+            RootShellManager.isRootCached() || RootShellManager.isRootAvailable()
+        } catch (e: Exception) {
+            Log.w(TAG, "Root kontrolu yapilamadi: ${e.message}")
+            false
+        }
+    }
+
+    private fun resolveApkPath(): String? {
+        return try {
+            RootShellManager.executeSingle("pm path ${RootShellManager.shellQuote(APP_PACKAGE)}")
+                .lineSequence()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("package:") }
+                ?.removePrefix("package:")
+                ?.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.w(TAG, "APK yolu okunamadi: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * RootDisplayRecorder ile ayni app_process desenini kullanarak cagri sesini UID 0 altinda kaydeder.
+     * Basarili olursa isRecording true yapilir ve normal AudioRecord yolu atlanir.
+     */
+    private fun startRootRecording(targetWavFile: File, apkPath: String): Boolean {
+        val parentDir = targetWavFile.parentFile ?: return false
+        if (!parentDir.exists()) parentDir.mkdirs()
+
+        val stopFile = File(parentDir, "${targetWavFile.name}.stop")
+        val errFile = File(parentDir, "root_audio_${System.currentTimeMillis()}.log")
+
+        runCatching { if (stopFile.exists()) stopFile.delete() }
+        runCatching { if (targetWavFile.exists()) targetWavFile.delete() }
+
+        val cmd = "CLASSPATH=${RootShellManager.shellQuote(apkPath)} " +
+            "app_process /system/bin $ROOT_HELPER_CLASS " +
+            "${RootShellManager.shellQuote(targetWavFile.absolutePath)} " +
+            "${RootShellManager.shellQuote(stopFile.absolutePath)} " +
+            "${Process.myPid()} " +
+            ">/dev/null 2>${RootShellManager.shellQuote(errFile.absolutePath)} & echo \$!"
+
+        val pidStr = RootShellManager.executeSingle(cmd).trim()
+        val pid = pidStr.lineSequence().map { it.trim() }.lastOrNull()?.toIntOrNull() ?: -1
+        if (pid <= 0) {
+            Log.e(TAG, "Root ses kaydedici PID alinamadi: '$pidStr'")
+            cleanupRootArtifacts(stopFile, errFile, targetWavFile)
+            return false
+        }
+
+        var started = false
+        var failureReason: String? = null
+        var lastError = ""
+        val startupBeganAt = SystemClock.elapsedRealtime()
+        var lastProgressLogAt = startupBeganAt
+        var lastErrorPollAt = startupBeganAt
+
+        for (i in 0 until ROOT_STARTUP_ATTEMPTS) {
+            Thread.sleep(ROOT_STARTUP_WAIT_MS)
+            // 44 baytlik WAV basligi yalnizca AudioRecord basariyla acildiktan sonra yazilir;
+            // gercek veri beklenerek >44 sartinin gecmesi saglanir.
+            if (targetWavFile.exists() && targetWavFile.length() > 44L) {
+                started = true
+                break
+            }
+            // Basarisizlik karari: surec gercekten oldu veya yardimci stderr'e gercek hata yazdi.
+            if (!File("/proc/$pid").exists()) {
+                failureReason = "yardimci surec sonlandi"
+                break
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastErrorPollAt >= ROOT_STARTUP_ERROR_POLL_MS) {
+                lastErrorPollAt = now
+                lastError = readRootError(errFile)
+                if (lastError.isNotEmpty()) {
+                    failureReason = "stderr hatasi"
+                    break
+                }
+            }
+            if (now - lastProgressLogAt >= ROOT_STARTUP_PROGRESS_LOG_MS) {
+                lastProgressLogAt = now
+                Log.w(TAG, "Root ses kaydedici hala baslatiliyor (PID=$pid, ${now - startupBeganAt} ms)")
+            }
+        }
+
+        if (!started) {
+            if (lastError.isEmpty()) lastError = readRootError(errFile)
+            // "Surec hayatta" kabulü yok: dosya gercek veri uretmiyorsa kok yolundan cikilir
+            // ve normal (uygulama UID) AudioRecord yedege donulur.
+            Log.e(TAG, "Root ses kaydedici baslayamadi (PID=$pid, ${failureReason ?: "zaman asimi"}): $lastError")
+        }
+
+        if (!started) {
+            runCatching { RootShellManager.execute("touch ${RootShellManager.shellQuote(stopFile.absolutePath)}") }
+            Thread.sleep(120)
+            runCatching { RootShellManager.execute("kill -15 $pid 2>/dev/null") }
+            Thread.sleep(300)
+            runCatching { RootShellManager.execute("kill -9 $pid 2>/dev/null") }
+            cleanupRootArtifacts(stopFile, errFile, targetWavFile)
+            return false
+        }
+
+        rootRecorderPid = pid
+        rootStopFile = stopFile
+        rootLogFile = errFile
+        rootRecording = true
+        recordedChannels = 1
+        isRecording = true
+
+        // Tanilama dosyasi basarida birikmesin: bos ise hemen silinir, dolu ise durdurmada silinir.
+        if (errFile.length() == 0L) {
+            runCatching { errFile.delete() }
+        }
+
+        Log.i(TAG, "Root ses kaydedici baslatildi: PID=$pid, dosya=${targetWavFile.name}")
+        return true
+    }
+
+    private fun stopRootRecording() {
+        val stopFile = rootStopFile
+        val pid = rootRecorderPid
+        val logFile = rootLogFile
+        rootStopFile = null
+        rootRecorderPid = -1
+        rootLogFile = null
+        rootRecording = false
+
+        if (stopFile != null) {
+            runCatching {
+                RootShellManager.execute("touch ${RootShellManager.shellQuote(stopFile.absolutePath)}")
+            }
+        }
+
+        if (pid > 0) {
+            var stillAlive = waitForHelperExit(pid, ROOT_STOP_WAIT_ATTEMPTS, 50L)
+            if (stillAlive) {
+                // Son baslik yazimi ve dosya kapatma icin once yumusak sonlandirma denenir.
+                Log.w(TAG, "Root ses kaydedici stop dosyasini islemedi, SIGTERM gonderiliyor: PID=$pid")
+                runCatching { RootShellManager.execute("kill -15 $pid 2>/dev/null") }
+                stillAlive = waitForHelperExit(pid, ROOT_STOP_TERM_WAIT_ATTEMPTS, 50L)
+            }
+            if (stillAlive) {
+                Log.w(TAG, "Root ses kaydedici SIGTERM sonrasi kapanmadi, zorla sonlandiriliyor: PID=$pid")
+                runCatching { RootShellManager.execute("kill -9 $pid 2>/dev/null") }
+                waitForHelperExit(pid, 10, 50L)
+            }
+        }
+
+        if (stopFile != null) {
+            runCatching {
+                RootShellManager.execute("rm -f ${RootShellManager.shellQuote(stopFile.absolutePath)}")
+            }
+        }
+
+        outputFile?.let { wavFile ->
+            runCatching {
+                RootShellManager.execute("chmod 666 ${RootShellManager.shellQuote(wavFile.absolutePath)} 2>/dev/null")
+            }
+        }
+
+        // Item 4: basarili kayit sonrasi tanilama logu birikmesin.
+        if (logFile != null) {
+            val removed = runCatching { logFile.delete() }.getOrDefault(false)
+            if (!removed && logFile.exists()) {
+                runCatching {
+                    RootShellManager.execute("rm -f ${RootShellManager.shellQuote(logFile.absolutePath)}")
+                }
+            }
+        }
+    }
+
+    /** Yardimci surec kapanana kadar bekler; true donerse surec hala calisiyordur. */
+    private fun waitForHelperExit(pid: Int, attempts: Int, delayMs: Long): Boolean {
+        for (i in 0 until attempts) {
+            if (!File("/proc/$pid").exists()) return false
+            try {
+                Thread.sleep(delayMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        return File("/proc/$pid").exists()
+    }
+
+    private fun readRootError(errFile: File): String {
+        return try {
+            RootShellManager.executeSingle("cat ${RootShellManager.shellQuote(errFile.absolutePath)} 2>/dev/null")
+                .trim()
+                .take(300)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun cleanupRootArtifacts(stopFile: File?, errFile: File?, output: File?) {
+        val paths = listOfNotNull(stopFile?.absolutePath, errFile?.absolutePath, output?.absolutePath)
+        if (paths.isEmpty()) return
+        val cmd = "rm -f " + paths.joinToString(" ") { RootShellManager.shellQuote(it) }
+        runCatching { RootShellManager.execute(cmd) }
+    }
+
+    /**
+     * Karar penceresinde biriken stereo baytlari sol kanala indirger.
+     * Tum dosya degil, yalnizca ilk birkac saniyelik tampon islenir.
+     */
+    private fun writeMonoFromStereo(stereo: ByteArray, out: FileOutputStream) {
+        val frames = stereo.size / 4
+        if (frames <= 0) return
+        val mono = ByteArray(frames * 2)
+        for (frame in 0 until frames) {
+            mono[frame * 2] = stereo[frame * 4]
+            mono[frame * 2 + 1] = stereo[frame * 4 + 1]
+        }
+        out.write(mono, 0, mono.size)
     }
 
     private fun writeDualPcmToWav(
@@ -300,16 +588,25 @@ class AudioCaptureController {
 
         val micBuf = ShortArray(monoBufSize / 2)
         val stereoBytes = ByteArray(micBuf.size * 4)
+        val monoBytes = ByteArray(micBuf.size * 2)
         var currentIntChunk: ShortArray? = null
         var intOffset = 0
+
+        // Ilk saniyeler tamponda tutulur. Sag kanal veri uretmezse dosya en bastan mono yazilir,
+        // boylece durdurmada tum WAV kopyalanip donusturulmez.
+        val probation = ByteArrayOutputStream(64 * 1024)
+        var pendingFrames = 0
+        var stereoMode: Boolean? = null
+        var rightSignificant = false
 
         try {
             while (isRecording) {
                 val readMic = micRecord.read(micBuf, 0, micBuf.size)
                 if (readMic > 0) {
+                    var stereoLen = 0
+                    var monoLen = 0
                     for (i in 0 until readMic) {
                         val sampleLeft = micBuf[i]
-                        var sampleRight: Short = 0
 
                         if (currentIntChunk == null || intOffset >= currentIntChunk.size) {
                             currentIntChunk = internalQueue.poll()
@@ -318,17 +615,52 @@ class AudioCaptureController {
                             }
                             intOffset = 0
                         }
+                        var sampleRight: Short = 0
                         if (currentIntChunk != null && intOffset < currentIntChunk.size) {
                             sampleRight = currentIntChunk[intOffset++]
+                            // Tamamen sifir ornekler "veri var" sayilmaz.
+                            if (sampleRight.toInt() != 0) rightSignificant = true
                         }
 
+                        val leftValue = sampleLeft.toInt()
+                        val rightValue = sampleRight.toInt()
                         val base = i * 4
-                        stereoBytes[base] = (sampleLeft.toInt() and 0xFF).toByte()
-                        stereoBytes[base + 1] = ((sampleLeft.toInt() shr 8) and 0xFF).toByte()
-                        stereoBytes[base + 2] = (sampleRight.toInt() and 0xFF).toByte()
-                        stereoBytes[base + 3] = ((sampleRight.toInt() shr 8) and 0xFF).toByte()
+                        stereoBytes[base] = (leftValue and 0xFF).toByte()
+                        stereoBytes[base + 1] = ((leftValue shr 8) and 0xFF).toByte()
+                        stereoBytes[base + 2] = (rightValue and 0xFF).toByte()
+                        stereoBytes[base + 3] = ((rightValue shr 8) and 0xFF).toByte()
+                        monoBytes[i * 2] = (leftValue and 0xFF).toByte()
+                        monoBytes[i * 2 + 1] = ((leftValue shr 8) and 0xFF).toByte()
+                        stereoLen = (i + 1) * 4
+                        monoLen = (i + 1) * 2
                     }
-                    fos.write(stereoBytes, 0, readMic * 4)
+
+                    when (stereoMode) {
+                        null -> {
+                            probation.write(stereoBytes, 0, stereoLen)
+                            pendingFrames += readMic
+                            if (rightSignificant || pendingFrames >= MONO_DECISION_WINDOW_FRAMES) {
+                                val pending = probation.toByteArray()
+                                probation.reset()
+                                pendingFrames = 0
+                                if (rightSignificant) {
+                                    stereoMode = true
+                                    fos.write(pending, 0, pending.size)
+                                    Log.i(TAG, "Sag kanal veri uretiyor, kayit stereo surduruluyor")
+                                } else {
+                                    stereoMode = false
+                                    recordedChannels = 1
+                                    writeMonoFromStereo(pending, fos)
+                                    Log.w(
+                                        TAG,
+                                        "Ilk $MONO_DECISION_WINDOW_SECONDS sn icinde sag kanal veri uretmedi, kayit mono surduruluyor"
+                                    )
+                                }
+                            }
+                        }
+                        true -> fos.write(stereoBytes, 0, stereoLen)
+                        false -> fos.write(monoBytes, 0, monoLen)
+                    }
                 } else if (readMic < 0) {
                     break
                 }
@@ -336,6 +668,16 @@ class AudioCaptureController {
         } catch (e: Exception) {
             Log.e(TAG, "Cift kanal PCM yazma hatasi", e)
         } finally {
+            // Karar verilemeden biten kayitlarda tampon yine mono/stereo olarak kapatilir.
+            if (stereoMode == null) {
+                val pending = probation.toByteArray()
+                if (rightSignificant) {
+                    if (pending.isNotEmpty()) fos.write(pending, 0, pending.size)
+                } else {
+                    recordedChannels = 1
+                    if (pending.isNotEmpty()) writeMonoFromStereo(pending, fos)
+                }
+            }
             try { fos.flush() } catch (_: Exception) {}
             try { fos.close() } catch (_: Exception) {}
         }

@@ -33,6 +33,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.math.abs
 
 class CallMonitorService : Service() {
 
@@ -45,6 +46,11 @@ class CallMonitorService : Service() {
 
         const val EXTRA_PHONE_NUMBER = "extra_phone_number"
         const val EXTRA_CALL_TYPE = "extra_call_type"
+
+        private const val CALL_LOG_RETRY_DELAY_MS = 500L
+        private const val CALL_LOG_QUERY_ATTEMPTS = 4
+        private const val CALL_LOG_STRICT_DISTANCE_MS = 5_000L
+        private const val CALL_LOG_MATCH_WINDOW_MS = 120_000L
 
         private val _isAmbientRecordingFlow = MutableStateFlow(false)
         val isAmbientRecordingFlow = _isAmbientRecordingFlow.asStateFlow()
@@ -187,7 +193,18 @@ class CallMonitorService : Service() {
                             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                     )
                 } catch (e: SecurityException) {
-                    Log.w(TAG, "Microphone FGS type reddedildi, specialUse ile devam ediliyor: ${e.message}")
+                    val rootReady = RootShellManager.isRootCached() || RootShellManager.isRootAvailable()
+                    val audioPathInfo = if (rootReady) {
+                        "Cagri sesi root yardimci kaydedici ile alinacak."
+                    } else {
+                        "Root yok, uygulama UID'sindeki mikrofon sistem tarafindan sessize alinabilir."
+                    }
+                    Log.e(
+                        TAG,
+                        "MICROPHONE FGS tipi reddedildi, specialUse ile devam ediliyor. " +
+                            "root=$rootReady. $audioPathInfo Hata: ${e.message}",
+                        e
+                    )
                     startForeground(
                         1001,
                         notification,
@@ -224,20 +241,38 @@ class CallMonitorService : Service() {
         Log.i(TAG, "Ses kaydi oturumu baslatildi: $phoneNumber ($callType, dual=$isDualChannel)")
 
         serviceScope.launch {
-            sessionMutex.withLock {
-                if (!isRecording) return@withLock
-                val started = audioController.startRecording(targetFile, enableDualInternalMic = isDualChannel)
-                if (!started) {
-                    Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
-                    isRecording = false
-                    if (callType == CallType.AMBIENT_RECORDING) {
-                        _isAmbientRecordingFlow.value = false
+            if (!isRecording) return@launch
+            // Root baslangici (ART yukleme + AudioRecord) 9 sn kadar sessionMutex'i tutmaz;
+            // boylece siradaki durdurma istegi bu beklemeden gecikirmez.
+            val started = audioController.startRecording(
+                targetFile,
+                enableDualInternalMic = isDualChannel,
+                useRootCapture = isDualChannel,
+                rootApkPath = packageCodePath
+            )
+            if (!started) {
+                sessionMutex.withLock {
+                    if (isRecording) {
+                        Log.w(TAG, "Ses kaydi baslatilamadi, bos oturum kapatiliyor")
+                        isRecording = false
+                        if (callType == CallType.AMBIENT_RECORDING) {
+                            _isAmbientRecordingFlow.value = false
+                        }
+                        targetFile.delete()
+                        audioFile = null
                     }
+                }
+                shutdownIfIdle("kayit baslatilamadi")
+                return@launch
+            }
+            if (!isRecording) {
+                // Baslatma sirasinda durdurma geldi; acilan kaynagi hemen kapat ve dosyayi temizle.
+                sessionMutex.withLock {
+                    runCatching { audioController.stopRecordingSuspend() }
                     targetFile.delete()
                     audioFile = null
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
                 }
+                shutdownIfIdle("kayit baslatilamadan durduruldu")
             }
         }
     }
@@ -267,8 +302,7 @@ class CallMonitorService : Service() {
             if (!hasValidAudio || durationSec < 1L) {
                 Log.w(TAG, "Bos veya 0 saniyelik kayit elendi (size=${capturedFile?.length() ?: 0}, sure=${durationSec}s)")
                 capturedFile?.delete()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                shutdownIfIdle("gecersiz kayit")
                 return@launch
             }
 
@@ -280,10 +314,7 @@ class CallMonitorService : Service() {
                 finalContactName = "Yüz Yüze / Ortam Kaydı"
             } else {
                 if (finalNumber == "Bilinmeyen" || finalNumber.isBlank()) {
-                    val logInfo = resolveCallInfoFromLog(capturedStart) ?: run {
-                        delay(500)
-                        resolveCallInfoFromLog(capturedStart)
-                    }
+                    val logInfo = resolveCallInfoFromLog(capturedStart, endTimeMs)
                     if (logInfo != null) {
                         finalNumber = logInfo.number
                         finalContactName = logInfo.cachedName
@@ -319,6 +350,20 @@ class CallMonitorService : Service() {
                 LogSuApp.instance.repository.updateTranscript(recordId, transcriptText)
             }
 
+            shutdownIfIdle("kayit tamamlandi")
+        }
+    }
+
+    /**
+     * Servisi yalnizca bu sirada baska bir kayit baslamadiysa kapatir.
+     * Onceki oturumun kapanis coroutine'i yeni oturumu oldurmemelidir.
+     */
+    private suspend fun shutdownIfIdle(reason: String) {
+        sessionMutex.withLock {
+            if (isRecording) {
+                Log.i(TAG, "Baska kayit aktif, servis kapatilmiyor ($reason)")
+                return@withLock
+            }
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -350,9 +395,42 @@ class CallMonitorService : Service() {
         return dir
     }
 
-    private data class CallLogInfo(val number: String, val cachedName: String?, val callType: CallType?)
+    private data class CallLogInfo(
+        val number: String,
+        val cachedName: String?,
+        val callType: CallType?,
+        val dateMs: Long,
+        val durationSec: Long
+    )
 
-    private fun resolveCallInfoFromLog(afterTimestampMs: Long): CallLogInfo? {
+    /**
+     * Kaydin baslangic/bitis zamanina en yakin CallLog satirini secer.
+     * CallLog satiri IDLE yayinindan sonra 0.5-2 sn gecikmeyle yazilabildigi icin
+     * once dar, sonra genis pencerede birkac kez denenir.
+     */
+    private suspend fun resolveCallInfoFromLog(startMs: Long, endMs: Long): CallLogInfo? {
+        repeat(CALL_LOG_QUERY_ATTEMPTS) { attempt ->
+            val strictMatch = queryClosestCallLog(startMs, endMs, CALL_LOG_STRICT_DISTANCE_MS)
+            if (strictMatch != null) {
+                if (attempt > 0) Log.d(TAG, "CallLog kaydi ${attempt + 1}. denemede bulundu")
+                return strictMatch
+            }
+            if (attempt < CALL_LOG_QUERY_ATTEMPTS - 1) {
+                delay(CALL_LOG_RETRY_DELAY_MS)
+            }
+        }
+
+        val looseMatch = queryClosestCallLog(startMs, endMs, CALL_LOG_MATCH_WINDOW_MS)
+        if (looseMatch != null) {
+            Log.i(TAG, "CallLog kaydi genis pencerede eslesti (kayit=$startMs, log=${looseMatch.dateMs})")
+        } else {
+            Log.w(TAG, "CallLog eslesmesi bulunamadi (kayit=$startMs)")
+        }
+        return looseMatch
+    }
+
+    private fun queryClosestCallLog(startMs: Long, endMs: Long, maxDistanceMs: Long): CallLogInfo? {
+        val windowStart = startMs - CALL_LOG_MATCH_WINDOW_MS
         return try {
             val cursor = contentResolver.query(
                 CallLog.Calls.CONTENT_URI,
@@ -360,26 +438,57 @@ class CallMonitorService : Service() {
                     CallLog.Calls.NUMBER,
                     CallLog.Calls.CACHED_NAME,
                     CallLog.Calls.TYPE,
-                    CallLog.Calls.DATE
+                    CallLog.Calls.DATE,
+                    CallLog.Calls.DURATION
                 ),
                 "${CallLog.Calls.DATE} >= ?",
-                arrayOf((afterTimestampMs - 60_000L).toString()),
+                arrayOf(windowStart.toString()),
                 "${CallLog.Calls.DATE} DESC"
             )
+            val expectedDurationSec = ((endMs - startMs) / 1000L).coerceAtLeast(0L)
             cursor?.use {
-                if (it.moveToFirst()) {
-                    val num = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
-                    val name = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME))
-                    val typeInt = it.getInt(it.getColumnIndexOrThrow(CallLog.Calls.TYPE))
-                    val inferredType = when (typeInt) {
-                        CallLog.Calls.INCOMING_TYPE -> CallType.INCOMING_GSM
-                        CallLog.Calls.OUTGOING_TYPE -> CallType.OUTGOING_GSM
-                        else -> null
+                val numberIdx = it.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+                val nameIdx = it.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+                val typeIdx = it.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+                val dateIdx = it.getColumnIndexOrThrow(CallLog.Calls.DATE)
+                val durationIdx = it.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+
+                var best: CallLogInfo? = null
+                var bestScore = Long.MAX_VALUE
+
+                while (it.moveToNext()) {
+                    val num = it.getString(numberIdx)
+                    if (num.isNullOrBlank()) continue
+
+                    val dateMs = it.getLong(dateIdx)
+                    val distance = when {
+                        dateMs in startMs..endMs -> 0L
+                        dateMs < startMs -> startMs - dateMs
+                        else -> dateMs - endMs
                     }
-                    if (!num.isNullOrBlank()) {
-                        CallLogInfo(num, name, inferredType)
-                    } else null
-                } else null
+                    if (distance > maxDistanceMs) continue
+
+                    val durationSec = it.getLong(durationIdx)
+                    val durationDiff = abs(durationSec - expectedDurationSec).coerceAtMost(999L)
+                    val score = distance * 1000L + durationDiff
+                    if (score < bestScore) {
+                        bestScore = score
+                        val typeInt = it.getInt(typeIdx)
+                        val inferredType = when (typeInt) {
+                            CallLog.Calls.INCOMING_TYPE -> CallType.INCOMING_GSM
+                            CallLog.Calls.OUTGOING_TYPE -> CallType.OUTGOING_GSM
+                            else -> null
+                        }
+                        best = CallLogInfo(
+                            number = num,
+                            cachedName = it.getString(nameIdx),
+                            callType = inferredType,
+                            dateMs = dateMs,
+                            durationSec = durationSec
+                        )
+                    }
+                }
+                best
             }
         } catch (e: Exception) {
             Log.w(TAG, "CallLog sorgulanamadi: ${e.message}")
@@ -417,7 +526,18 @@ class CallMonitorService : Service() {
 
     override fun onDestroy() {
         _isAmbientRecordingFlow.value = false
+        isRecording = false
+        val hadActiveRecording = audioController.isActiveRecording()
         serviceScope.cancel()
+        if (hadActiveRecording) {
+            // serviceScope iptal edildigi icin aktif kayit bagimsiz kapsamda duzgun kapatilir (WAV basligi yazilir).
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                sessionMutex.withLock {
+                    runCatching { audioController.stopRecordingSuspend() }
+                }
+                Log.i(TAG, "Servis kapanirken aktif ses kaydi durduruldu")
+            }
+        }
         super.onDestroy()
     }
 }

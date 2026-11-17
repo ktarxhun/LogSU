@@ -45,7 +45,7 @@ class RecordRepository(
                     throw IOException("Kayıt dosyası silinemedi")
                 }
                 if (!file.delete()) {
-                    val hasRoot = runCatching { RootShellManager.isRootCached() }.getOrDefault(false)
+                    val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
                     if (hasRoot) {
                         runCatching {
                             RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)}")
@@ -78,9 +78,7 @@ class RecordRepository(
             val current = callRecordDao.getRecordById(record.id) ?: continue
             if (current.isLocked) continue
             try {
-                deleteFiles(listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath))
-                val removed = callRecordDao.deleteUnlockedRecordById(current.id)
-                if (removed > 0) {
+                if (purgeRecord(current)) {
                     purgedCount++
                 }
             } catch (e: IOException) {
@@ -88,6 +86,46 @@ class RecordRepository(
             }
         }
         return purgedCount
+    }
+
+    /**
+     * Temizlikte kilit yarisini onler: once kosullu DB silme yapilir; kilit bu arada
+     * kapatilmissa satir silinir ve dosyalar best effort silinir. Quarantine/geri tasinma
+     * penceresi yoktur, boylece surec cokerse kayit dosyasiz kalmaz ve artik dosya kalintisi
+     * kayit satiri olmadan geride birakilmaz.
+     */
+    private suspend fun purgeRecord(current: CallRecord): Boolean = withContext(Dispatchers.IO) {
+        val files = listOf(current.audioFilePath, current.videoFilePath, current.touchFilePath)
+            .filterNotNull()
+            .distinct()
+            .map { File(it) }
+            .filter { it.exists() }
+
+        if (files.any { !it.isFile }) {
+            throw IOException("Kayıt dosyası silinemedi")
+        }
+
+        val removed = callRecordDao.deleteUnlockedRecordById(current.id)
+        if (removed == 0) {
+            Log.w(TAG, "Kayit kilitli veya zaten silinmis, dosyalara dokunulmuyor (ID=${current.id})")
+            return@withContext false
+        }
+
+        for (file in files) {
+            deleteFileQuietly(file)
+        }
+        true
+    }
+
+    private fun deleteFileQuietly(file: File) {
+        if (!file.exists()) return
+        if (file.delete()) return
+        val hasRoot = runCatching { RootShellManager.isRootAvailable() }.getOrDefault(false)
+        if (hasRoot) {
+            runCatching {
+                RootShellManager.execute("rm -f ${RootShellManager.shellQuote(file.absolutePath)} 2>/dev/null")
+            }
+        }
     }
 
     // Emanet Oturumu Fonksiyonları
