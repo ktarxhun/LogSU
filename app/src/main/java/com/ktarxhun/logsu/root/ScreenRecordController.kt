@@ -201,21 +201,33 @@ class ScreenRecordController {
         }
     }
 
+    private fun isProcessAlive(pid: Int): Boolean =
+        RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim() == "1"
+
+    /**
+     * Surec /proc'tan kaybolana kadar en fazla [attempts] kez bekler ve olur olmaz erken doner.
+     * (Onceki surumdeki `repeat { return@repeat }` dongu basinda durmuyordu; kalan turlari bosa
+     * harcayip gereksiz root kabuk cagrilari uretiyordu.) Donus: true = hala calisiyor.
+     */
+    private suspend fun waitForProcessExit(pid: Int, attempts: Int, delayMs: Long = 50L): Boolean {
+        for (i in 0 until attempts) {
+            if (!isProcessAlive(pid)) return false
+            delay(delayMs)
+        }
+        return isProcessAlive(pid)
+    }
+
     private suspend fun stopActiveRecorderProcess(pid: Int, stopFile: File?) {
         if (stopFile != null) {
             RootShellManager.execute("touch '${stopFile.absolutePath}'")
             if (pid > 0) {
-                repeat(50) {
-                    val alive = RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim()
-                    if (alive != "1") return@repeat
-                    delay(50)
-                }
+                waitForProcessExit(pid, attempts = 50)
             }
             RootShellManager.execute("rm -f '${stopFile.absolutePath}'")
         }
 
         val stillAlive = if (pid > 0) {
-            RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim() == "1"
+            isProcessAlive(pid)
         } else {
             stopFile == null
         }
@@ -229,13 +241,7 @@ class ScreenRecordController {
             RootShellManager.execute(killCmd)
 
             if (pid > 0) {
-                repeat(40) {
-                    val alive = RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim()
-                    if (alive != "1") return@repeat
-                    delay(50)
-                }
-                val forceCheck = RootShellManager.executeSingle("if [ -d /proc/$pid ]; then echo 1; else echo 0; fi").trim()
-                if (forceCheck == "1") {
+                if (waitForProcessExit(pid, attempts = 40)) {
                     RootShellManager.execute("kill -9 $pid 2>/dev/null")
                 }
             } else {
